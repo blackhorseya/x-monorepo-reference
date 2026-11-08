@@ -1,0 +1,854 @@
+# https://taskfile.dev — single source of truth for every check.
+# Claude Code hooks (.claude/settings.json), lefthook and CI only call tasks here;
+# none of them carry logic of their own.
+#
+#   gate-fast   seconds   fmt + vet + depguard on the module(s) owning FILE   (PostToolUse / pre-commit)
+#   gate-local  ~1 min    gen freshness + {{.BUF}} lint + affected tests           (Stop hook / pre-push)
+#   gate-ci     full      everything, authoritative                          (GitHub Actions)
+version: '3'
+
+vars:
+  BIN_DIR: '{{.ROOT_DIR}}/bin'
+  # Prefer the pinned binaries from `task tools`; fall back to PATH (CI installs buf /
+  # golangci-lint via actions). OS env wins over Taskfile env, so PATH cannot be prepended here.
+  # The value is the bare path (or the bare name): it can hold a space or a shell metacharacter, so the path is spliced into the sh: command
+  # through shellQuote (a `"`, `$` or backtick in the parent directory broke the double quotes #505 used, #507) and every use below goes through shellQuote too.
+  BUF:
+    sh: '[ -x {{shellQuote (printf "%s/buf" .BIN_DIR)}} ] && printf "%s\n" {{shellQuote (printf "%s/buf" .BIN_DIR)}} || echo buf'
+  WIRE:
+    sh: '[ -x {{shellQuote (printf "%s/wire" .BIN_DIR)}} ] && printf "%s\n" {{shellQuote (printf "%s/wire" .BIN_DIR)}} || echo wire'
+  GOLANGCI_LINT:
+    sh: '[ -x {{shellQuote (printf "%s/golangci-lint" .BIN_DIR)}} ] && printf "%s\n" {{shellQuote (printf "%s/golangci-lint" .BIN_DIR)}} || echo golangci-lint'
+  # Container runtime for local infra: podman first, docker as fallback.
+  COMPOSE:
+    sh: 'command -v podman >/dev/null 2>&1 && echo "podman compose" || echo "docker compose"'
+  # Where the kind tasks (helm-kind-up / helm-kind / helm-kind-core / helm-kind-payment / helm-kind-keda / helm-kind-down) aim, #430. These are
+  # file-level literals ON PURPOSE: a task-level `vars:` entry beats the command line in go-task, so the
+  # same literal inside a task made `task helm-kind-up CLUSTER=probe` act on x-monorepo; at file level the
+  # command line wins and the OS environment does not (go-task reads the environment as template
+  # variables, so `{{.CLUSTER | default "x-monorepo"}}` would let a stray CLUSTER=foo in a shell re-aim the
+  # task). Name them on the command line or get the default.
+  CLUSTER: x-monorepo     # the kind cluster (kind create / load / delete --name, and kubectl's context kind-<CLUSTER>)
+  NS: x-monorepo          # the namespace the chart and its dependencies (Postgres, Redis, Dex) live in
+  KEDA_NS: keda           # the namespace helm-kind-keda installs KEDA itself into
+  # The kubeconfig the kind tasks use: written from `kind get kubeconfig --name <CLUSTER>`, so it holds that one cluster and
+  # nothing else. Every kubectl / helm / kind command and every kind/*.sh of these tasks runs through KIND_RUN
+  # (deployments/helm/kind/run.sh): `env -i`, an empty scratch HOME (no ~/.kube), KUBECONFIG and KIND_KUBECONFIG = the file below,
+  # PATH = the shims + the tools' directories, and BASH_ENV making those variables read-only in every bash it starts. The guarantee
+  # is that the caller's kubeconfig (~/.kube/config, $KUBECONFIG, a current-context such as production) is not in reach, not that a
+  # gate read the right words; the commands still carry `--kubeconfig "{{.KIND_KUBECONFIG}}"` (a second layer, and the shims add it
+  # for the scripts). run.sh also refuses to start when that file exists but is not the one `kind get kubeconfig` gives for the cluster
+  # it is named after (the entry check). See CLAUDE.md "kind target" for what this does not cover (#437, #444).
+  KIND_KUBECONFIG: '{{.BIN_DIR}}/kind/kubeconfig-{{.CLUSTER}}'
+  KIND_RUN: 'deployments/helm/kind/run.sh "{{.KIND_KUBECONFIG}}"'
+  # Empty unless the value is a plain lowercase DNS-ish name: the tasks interpolate these into shell commands.
+  KIND_TARGET_OK: '{{if and (regexMatch "^[a-z0-9][a-z0-9.-]*$" .CLUSTER) (regexMatch "^[a-z0-9][a-z0-9.-]*$" .NS) (regexMatch "^[a-z0-9][a-z0-9.-]*$" .KEDA_NS)}}ok{{end}}'
+  # Config file `task run` / `task migrate` load (APP_CONFIG). Gitignored; seeded from
+  # configs/config.example.yaml on first use. Override: task run CONFIG=<file>
+  CONFIG: '{{.CONFIG | default (printf "%s/configs/local.yaml" .ROOT_DIR)}}'
+  # `task run` talks to the catalog service `task catalog-rpc` runs (rpc has no catalog of its own). The
+  # key is the local dev one (rpc=<key>:admin in auth.api_keys of configs/catalog-rpc.example.yaml, which
+  # apps/catalog-rpc/config_example_test.go keeps equal to this one); nothing here is a credential.
+  CATALOG_PORT: '{{.CATALOG_PORT | default "8081"}}'
+  # Config file `task catalog-rpc` loads (APP_CONFIG). Gitignored; seeded from configs/catalog-rpc.example.yaml.
+  # Override: task catalog-rpc CATALOG_CONFIG=<file>
+  CATALOG_CONFIG: '{{.CATALOG_CONFIG | default (printf "%s/configs/catalog-rpc.yaml" .ROOT_DIR)}}'
+  CATALOG_DEV_KEY: dev-catalog-service-key-0123456789abcdef
+  # Config file `task payment-rpc` loads (APP_CONFIG). Gitignored; seeded from configs/payment-rpc.example.yaml.
+  # Override: task payment-rpc PAYMENT_CONFIG=<file>
+  PAYMENT_CONFIG: '{{.PAYMENT_CONFIG | default (printf "%s/configs/payment-rpc.yaml" .ROOT_DIR)}}'
+
+  BUF_VERSION: v1.74.0
+  PROTOC_GEN_GO_VERSION: v1.36.12
+  PROTOC_GEN_CONNECT_GO_VERSION: v1.21.1
+  WIRE_VERSION: v0.7.0
+  GOLANGCI_LINT_VERSION: v2.14.0
+  LEFTHOOK_VERSION: v2.2.2
+  CONNECT_OPENAPI_VERSION: v0.28.0
+  GORELEASER_VERSION: v2.18.2   # .github/workflows/release.yml pins the same minor
+  KUBECONFORM_VERSION: v0.7.0   # helm-check; helm itself comes from PATH (brew install helm)
+
+  # Bounded contexts that publish an OpenAPI document (pkgs/<bc>/contract/v1/openapi.yaml).
+  BCS: ordering inventory identity catalog payment
+  # Every Go module in the workspace, one per line: go.work is the only list (#413). Resolved on every task run (like BUF above),
+  # so go and jq must be on PATH; a failing pipeline fails the task rather than yield an empty list. scripts/modules.jq is the one
+  # rule for what a path may be (it is spliced into shell commands below): anything outside [A-Za-z0-9._/-] fails every task.
+  # `for` loops split it on "\n" and quote the item with shellQuote.
+  MODULES:
+    sh: set -o pipefail; go work edit -json go.work | jq -r -f scripts/modules.jq
+  APPS: rpc migrate worker catalog-rpc payment-rpc payment-worker
+
+tasks:
+  default:
+    cmds: [task --list]
+    silent: true
+
+  all:
+    desc: gen → wire → lint → test → build
+    cmds:
+      - task: gen
+      - task: wire
+      - task: lint
+      - task: test
+      - task: build
+
+  # ── Gates ───────────────────────────────────────────────────────────────────
+
+  affected:
+    desc: print modules touched by the current change (scripts/affected.sh)
+    cmds: [scripts/affected.sh]
+    silent: true
+
+  gate-fast:
+    desc: 'gofmt + vet + golangci-lint --fast-only + archtest on the modules owning the given files'
+    summary: |
+      task gate-fast FILE="a.go b.go"     # or
+      task gate-fast -- a.go b.go         # lefthook passes {staged_files} this way (no shell quoting)
+    vars:
+      FILES: '{{.FILE | default .CLI_ARGS}}'
+    preconditions:
+      - sh: test -n "{{.FILES}}"
+        msg: 'usage: task gate-fast FILE="<path>..."  |  task gate-fast -- <path>...'
+    silent: true
+    cmds:
+      - |
+        bad=$(gofmt -l $(echo "{{.FILES}}" | tr ' ' '\n' | grep '\.go$' || true))
+        if [ -n "$bad" ]; then echo "gofmt: $bad"; exit 1; fi
+      - |
+        for m in $(scripts/affected.sh --files {{.FILES}}); do
+          echo ">> $m"
+          (cd "$m" && go vet ./...) || exit 1
+          if [ -x {{shellQuote .BIN_DIR}}/golangci-lint ] || command -v golangci-lint >/dev/null; then (cd "$m" && {{shellQuote .GOLANGCI_LINT}} run --fast-only ./...) || exit 1; fi
+          # DDD rules (archtest) are an AST walk, ~1s: cheap enough to report on every edit.
+          if [ -f "$m/arch_test.go" ]; then (cd "$m" && go test -count=1 -run '^TestArchitecture$' .) || exit 1; fi
+        done
+
+  gate-local:
+    desc: what the agent / pre-push must pass before claiming "done"
+    cmds:
+      - task: check-gen-fresh
+      - '{{shellQuote .BUF}} lint'
+      - task: test-affected
+
+  gate-ci:
+    desc: everything (CI runs the pieces as separate jobs; this is the local equivalent)
+    cmds:
+      - task: check-gen-fresh
+      - task: check-work-sync
+      - task: lint
+      - task: test
+      - task: cover-gate
+      - task: build
+      - task: helm-check
+      - task: scripts-test
+
+  scripts-test:
+    desc: 'scripts/test.sh: ci-changes (which jobs a change runs), affected, releasable and cosign-sign-blob against throwaway git repos or a fake cosign, plus the k6-auth shard coverage, the cache-write plan, the release image lists, the MODULES derivation and the console OIDC env gate'
+    cmds:
+      - scripts/test.sh
+
+  merge-ready:
+    desc: 'before merging: is the PR green on main-as-of-now + its head? (task merge-ready -- 188; scripts/merge-ready.sh)'
+    cmds:
+      - scripts/merge-ready.sh {{.CLI_ARGS}}
+
+  test-affected:
+    desc: go test -race on affected modules only
+    silent: true
+    cmds:
+      - |
+        mods=$(scripts/affected.sh)
+        [ -n "$mods" ] || { echo "nothing affected"; exit 0; }
+        for m in $mods; do echo ">> $m"; (cd "$m" && go test -race ./...) || exit 1; done
+
+  cover-gate:
+    desc: domain packages must be 100% covered
+    cmds: [scripts/cover-gate.sh]
+
+  check-gen-fresh:
+    desc: regenerating must produce no diff — Go / OpenAPI / Wire only, NOT TS (use check-gen-fresh-all for TS freshness)
+    cmds:
+      # every tool both halves need, before the first one deletes anything (wire alone would fail only after gen had rewritten the tree)
+      - task: tools-check
+        vars: { NEED: ' buf protoc-gen-go protoc-gen-connect-go protoc-gen-connect-openapi wire ' }
+      - task: gen
+      - task: wire
+      - |
+        git diff --quiet -- '*.pb.go' '*.connect.go' '*wire_gen.go' '*/contract/*/*openapi.yaml' || {
+          echo "generated code is stale — commit the result of: task gen wire"
+          git --no-pager diff --stat -- '*.pb.go' '*.connect.go' '*wire_gen.go' '*/contract/*/*openapi.yaml'
+          exit 1
+        }
+
+  check-gen-fresh-all:
+    desc: the CI gen-freshness job runs exactly this — task gen wire gen-ts, then any unstaged diff fails (same scope as CI's `git diff --exit-code`, incl. TS; stage your changes first; needs network)
+    cmds:
+      - task: tools-check
+        vars: { NEED: ' buf protoc-gen-go protoc-gen-connect-go protoc-gen-connect-openapi wire ' }
+      - task: gen
+      - task: wire
+      - task: gen-ts
+      - |
+        git diff --quiet || {
+          echo "generated code is stale — commit the result of: task gen wire gen-ts"
+          git --no-pager diff --stat
+          exit 1
+        }
+
+  check-script-modes:
+    desc: every file `task tools` chmods +x is already 100755 in the git index (so a tools-cache miss cannot turn gen-freshness red on a mode-only diff, #454); scripts/check-script-modes.sh
+    cmds:
+      - scripts/check-script-modes.sh
+
+  check-work-sync:
+    desc: go.work and every go.mod agree, and every go.work module path is one a for-loop over MODULES can carry
+    cmds:
+      - scripts/check-modules.sh
+      - go work sync
+      - |
+        git diff --quiet -- go.work '*/go.mod' '*/*/go.mod' || { echo "go.mod drift — commit the result of: go work sync"; exit 1; }
+
+  # ── Tooling / codegen ───────────────────────────────────────────────────────
+
+  tools:
+    desc: install codegen tools into ./bin (pinned versions)
+    env: { GOBIN: '{{.BIN_DIR}}' }
+    cmds:
+      - go install github.com/bufbuild/buf/cmd/buf@{{.BUF_VERSION}}
+      - go install google.golang.org/protobuf/cmd/protoc-gen-go@{{.PROTOC_GEN_GO_VERSION}}
+      - go install connectrpc.com/connect/cmd/protoc-gen-connect-go@{{.PROTOC_GEN_CONNECT_GO_VERSION}}
+      - go install github.com/google/wire/cmd/wire@{{.WIRE_VERSION}}
+      - go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@{{.GOLANGCI_LINT_VERSION}}
+      - go install github.com/sudorandom/protoc-gen-connect-openapi@{{.CONNECT_OPENAPI_VERSION}}
+      - go install github.com/yannh/kubeconform/cmd/kubeconform@{{.KUBECONFORM_VERSION}}
+      - chmod +x scripts/*.sh scripts/hooks/*.sh deployments/helm/check.py deployments/helm/check-observability.py deployments/helm/kind/shim/kubectl deployments/helm/kind/shim/helm deployments/helm/check-negative.sh deployments/helm/check-mutants.py deployments/helm/check-chart-bump.py deployments/helm/check-chart-bump.sh deployments/helm/kind/*.sh
+
+  tools:hooks:
+    desc: install lefthook into ./bin and register the git hooks (humans only; CI never needs it)
+    env: { GOBIN: '{{.BIN_DIR}}' }
+    cmds:
+      - go install github.com/evilmartians/lefthook/v2@{{.LEFTHOOK_VERSION}}
+      - '{{.BIN_DIR}}/lefthook install'
+
+  # The first command of every task that deletes or writes with a ./bin tool (#504). `gen` deletes the tracked *.pb.go and
+  # *.connect.go and only then calls buf, so a worktree that never ran `task tools` used to lose 23 tracked files to a failing
+  # `buf generate`. This checks that each tool in NEED exists and can run, before anything is deleted or written, and fails with
+  # the way out; it never installs (a gate must not depend on the network: CI runs `task tools` first). The path checked is the one
+  # the command runs: buf and wire resolve like BUF / WIRE above (./bin copy, else the PATH copy), the plugins are bin/<name>
+  # (buf.gen.yaml and gen-openapi name them that way, relative to the Taskfile's directory, which is BIN_DIR's parent).
+  # NEED is a space-separated list with a space on both ends of the value: scripts/gen-tools-test.sh removes one tool at a time from it.
+  # silent: Task would otherwise echo this script, whose text holds the very message the tests look for.
+  tools-check:
+    internal: true
+    silent: true
+    requires: { vars: [NEED] }
+    cmds:
+      - |
+        missing=
+        for t in {{.NEED}}; do
+          case "$t" in
+            buf) p={{shellQuote .BUF}} ;;
+            wire) p={{shellQuote .WIRE}} ;;
+            *) p={{shellQuote .BIN_DIR}}"/$t" ;;
+          esac
+          case "$p" in
+            */*) if [ -f "$p" ] && [ -x "$p" ]; then :; else missing="$missing $t"; fi ;;
+            *) if command -v "$p" >/dev/null 2>&1; then :; else missing="$missing $t"; fi ;;
+          esac
+        done
+        if [ -n "$missing" ]; then
+          echo "codegen tool(s) missing or not executable:$missing — run: task tools (nothing was changed)" >&2
+          exit 1
+        fi
+
+  gen:
+    desc: protos → each module's contract/ (Go) + OpenAPI; needs the tools of `task tools` and checks for them before it deletes anything
+    # buf.gen.yaml has no clean:true because contract/ dirs also hold hand-written
+    # helpers; stale generated files are removed first.
+    cmds:
+      - task: tools-check
+        vars: { NEED: ' buf protoc-gen-go protoc-gen-connect-go protoc-gen-connect-openapi ' }
+      - '{{shellQuote .BUF}} format -w'
+      - find pkgs -name '*.pb.go' -delete
+      - find pkgs -path '*connect/*.connect.go' -delete
+      - '{{shellQuote .BUF}} generate'
+      - task: gen-openapi
+
+  gen-openapi:
+    desc: per-BC OpenAPI (Connect semantics) → pkgs/<bc>/contract/v1/openapi.yaml (+ platform's admin.v1)
+    cmds:
+      - task: tools-check
+        vars: { NEED: ' buf protoc-gen-connect-openapi ' }
+      - >-
+        {{shellQuote .BUF}} generate --path protos/admin --template
+        '{"version":"v2","plugins":[{"local":"bin/protoc-gen-connect-openapi","out":"pkgs/platform/contract/admin/v1","opt":["path=openapi.yaml","base=protos/admin/v1/openapi.base.yaml"]}]}'
+      - for: { var: BCS }
+        cmd: >-
+          {{shellQuote .BUF}} generate --path protos/{{.ITEM}} --template
+          '{"version":"v2","plugins":[{"local":"bin/protoc-gen-connect-openapi","out":"pkgs/{{.ITEM}}/contract/v1","opt":["path=openapi.yaml","base=protos/{{.ITEM}}/v1/openapi.base.yaml"]}]}'
+      # payment has an internal service (payment-rpc) and a public one (apps/rpc) in one package: apps/rpc
+      # publishes the public subset only, generated from its own proto file.
+      - >-
+        {{shellQuote .BUF}} generate --path protos/payment/v1/public.proto --template
+        '{"version":"v2","plugins":[{"local":"bin/protoc-gen-connect-openapi","out":"pkgs/payment/contract/v1","opt":["path=public.openapi.yaml","base=protos/payment/v1/public.openapi.base.yaml"]}]}'
+
+  gen-ts:
+    desc: protos → web/packages/proto (remote plugin, needs network)
+    cmds:
+      # tools/stripvalidate drops buf.validate's rule options and validate.proto (~70 kB of
+      # descriptor in the console bundle), keeping only Violations; see web/packages/proto/README.md.
+      # --include-imports emits that kept file (buf/validate/violations.proto); WKT are skipped.
+      - |
+        set -o pipefail
+        {{shellQuote .BUF}} build -o - | go run ./tools/stripvalidate | {{shellQuote .BUF}} generate --template buf.gen.ts.yaml --include-imports -
+
+  wire:
+    desc: regenerate DI graph for every app
+    cmds:
+      - task: tools-check
+        vars: { NEED: ' wire ' }
+      - for: { var: APPS }
+        cmd: '{{shellQuote .WIRE}} gen ./apps/{{.ITEM}}'
+
+  # ── Quality ─────────────────────────────────────────────────────────────────
+  # The go.work root is not a module, so `./...` matches nothing there: loop per module.
+
+  lint:
+    desc: proto lint + go vet + golangci-lint (depguard enforces layer / BC boundaries)
+    cmds:
+      - '{{shellQuote .BUF}} lint'
+      - for: { var: MODULES, split: "\n" }
+        cmd: printf '>> %s\n' {{shellQuote .ITEM}} && cd {{shellQuote .ITEM}} && go vet ./... && {{shellQuote .GOLANGCI_LINT}} run ./...
+
+  breaking:
+    desc: detect wire-incompatible proto changes against main
+    cmds: ["{{shellQuote .BUF}} breaking --against '.git#branch=main'"]
+
+  test:
+    desc: go test -race, every module
+    cmds:
+      - for: { var: MODULES, split: "\n" }
+        cmd: printf '>> %s\n' {{shellQuote .ITEM}} && cd {{shellQuote .ITEM}} && go test -race ./...
+
+  test-bin:
+    desc: compile test binaries into ./bin/test/
+    cmds:
+      - mkdir -p {{.BIN_DIR}}/test
+      - for: { var: MODULES, split: "\n" }
+        cmd: cd {{shellQuote .ITEM}} && go test -c -o {{.BIN_DIR}}/test/ ./...
+
+  cover:
+    desc: coverage summary per module
+    silent: true
+    cmds:
+      - mkdir -p {{.BIN_DIR}}
+      - for: { var: MODULES, split: "\n" }
+        cmd: |
+          prof={{.BIN_DIR}}/coverage-$(echo {{shellQuote .ITEM}} | tr / _).out
+          (cd {{shellQuote .ITEM}} && go test -coverprofile="$prof" ./... >/dev/null)
+          printf '%-16s ' {{.ITEM}}; go tool cover -func="$prof" | tail -1
+
+  # ── Build / run ─────────────────────────────────────────────────────────────
+
+  build:
+    desc: build every app into ./bin
+    cmds:
+      - for: { var: APPS }
+        cmd: go build -o {{.BIN_DIR}}/{{.ITEM}} ./apps/{{.ITEM}}
+
+  helm-check:
+    desc: 'lint + render + schema-check deployments/helm/x-monorepo under every ci/ profile, then deployments/helm/check.py asserts the derived shutdown / hook / prune numbers, check-observability.py the payment panels and alert rules, kind/negative-test.sh and kind/diag-test.sh the kind scripts against fake kubectl/helm (diag-test D7: a real Postgres in docker/podman)'
+    vars:
+      CHART: deployments/helm/x-monorepo
+      KUBECONFORM:
+        sh: '[ -x {{.BIN_DIR}}/kubeconform ] && echo {{.BIN_DIR}}/kubeconform || echo kubeconform'
+      PROFILES:
+        sh: ls {{.CHART}}/ci/*.yaml
+    cmds:
+      - for: { var: PROFILES }
+        cmd: |
+          helm lint --strict {{.CHART}} -f {{.ITEM}} >/dev/null
+          helm template t {{.CHART}} -f {{.ITEM}} | {{.KUBECONFORM}} -strict -summary -kubernetes-version 1.30.0 -schema-location default -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{"{{"}}.Group{{"}}"}}/{{"{{"}}.ResourceKind{{"}}"}}_{{"{{"}}.ResourceAPIVersion{{"}}"}}.json' >/dev/null
+          helm template t {{.CHART}} -f {{.ITEM}} | deployments/helm/check.py {{.ITEM}}
+      - deployments/helm/check-negative.sh
+      # every file `task tools` chmods +x is already 100755 in the index: a tools-cache miss must not turn gen-freshness red on a mode-only diff (#454). Kind scripts live here, so the helm job is the one a new 100644 script reaches
+      - scripts/check-script-modes.sh
+      # the payment panels and alert rules exist and name only metrics the code exports (deployments/docker/grafana)
+      - deployments/helm/check-observability.py
+      # negative.sh's reading of the refusal, against fake kubectl/helm (no cluster): retries, never asserts on a tool error
+      - deployments/helm/kind/negative-test.sh
+      # check.py goes red when a payment workload is made unsafe (envFrom, writable rootfs, command, the other app's image), per workload (#422)
+      - deployments/helm/check-mutants.py
+      # what a failed kind run leaves behind (#416): diag.sh (whole pod logs since the start, Postgres sessions and locks) against fake kubectl/helm/curl, payment-flow.sh running it before it restores the release, the kind Postgres' lock-wait logging
+      - deployments/helm/kind/diag-test.sh
+    preconditions:
+      - sh: command -v helm >/dev/null
+        msg: helm not found (brew install helm)
+      - sh: command -v docker >/dev/null || command -v podman >/dev/null
+        msg: needs docker or podman (kind/diag-test.sh D7 runs a real Postgres)
+
+  helm-kind-cluster:
+    desc: 'the first step of helm-kind-up, on its own (#437): the kind cluster CLUSTER (created if it does not exist; kind writes the kubeconfig below, never ~/.kube/config), the kubeconfig bin/kind/kubeconfig-<CLUSTER> from `kind get kubeconfig --name`, and the namespace NS created through it. Everything after it uses only that kubeconfig, so nothing the caller has in KUBECONFIG or a context named kind-<CLUSTER> can aim a write at another cluster;'
+    cmds:
+      - mkdir -p "{{.BIN_DIR}}/kind"
+      - '{{.KIND_RUN}} kind get clusters 2>/dev/null | grep -qx {{.CLUSTER}} || {{.KIND_RUN}} kind create cluster --name {{.CLUSTER}} --kubeconfig "{{.KIND_KUBECONFIG}}" --wait 2m'
+      - '{{.KIND_RUN}} kind get kubeconfig --name {{.CLUSTER}} > "{{.KIND_KUBECONFIG}}.tmp" && chmod 600 "{{.KIND_KUBECONFIG}}.tmp" && mv "{{.KIND_KUBECONFIG}}.tmp" "{{.KIND_KUBECONFIG}}"'
+      - '{{.KIND_RUN}} kubectl --kubeconfig "{{.KIND_KUBECONFIG}}" create namespace {{.NS}} --dry-run=client -o yaml | {{.KIND_RUN}} kubectl --kubeconfig "{{.KIND_KUBECONFIG}}" apply -f - >/dev/null'
+    preconditions:
+      - sh: command -v kind >/dev/null && command -v kubectl >/dev/null && command -v jq >/dev/null
+        msg: needs kind, kubectl, jq (brew install kind kubectl jq)
+      - sh: test -n "{{.KIND_TARGET_OK}}"
+        msg: CLUSTER, NS and KEDA_NS must be lowercase letters, digits, '.' or '-' and start with a letter or digit
+
+  helm-kind-up:
+    run: once   # helm-kind calls helm-kind-core and helm-kind-payment, each of which depends on this: one cluster, built once
+    deps: [web-build, helm-kind-cluster]
+    desc: 'the shared base of helm-kind-core, helm-kind-payment and helm-kind-keda: kind cluster + its own kubeconfig (helm-kind-cluster; reused if it exists), images built from the tree (rpc / catalog-rpc / payment-rpc / payment-worker / worker / migrate + the console on web-build) and kind-loaded, namespace, deployments/helm/kind/deps.yaml (Postgres, Redis) and dex.yaml (Dex dev IdP + CoreDNS rewrite for dex.localtest.me) rolled out. CI runs the three on separate clusters in parallel, so each one needs this on its own'
+    vars:
+      CHART: deployments/helm/x-monorepo
+      KIND_DIR: deployments/helm/kind
+      ARCH:
+        sh: go env GOARCH
+      DOCKER:
+        sh: 'command -v docker >/dev/null && echo docker || echo podman'
+    cmds:
+      - for: [rpc, catalog-rpc, payment-rpc, payment-worker, worker, migrate]
+        cmd: CGO_ENABLED=0 GOOS=linux GOARCH={{.ARCH}} go build -trimpath -o {{.BIN_DIR}}/kind/linux/{{.ARCH}}/{{.ITEM}} ./apps/{{.ITEM}}
+      # Same Dockerfile as the release (context layout <os>/<arch>/<app>); TARGETPLATFORM is set by
+      # hand because plain `docker build` / podman do not inject it the way buildx does.
+      # `localhost/` prefix: podman qualifies bare names with it anyway, so this is the one
+      # spelling docker, podman and the archive loaded into kind all agree on.
+      - for: [rpc, catalog-rpc, payment-rpc, payment-worker, worker, migrate]
+        cmd: '{{.DOCKER}} build -q -f deployments/docker/Dockerfile --build-arg APP={{.ITEM}} --build-arg TARGETPLATFORM=linux/{{.ARCH}} -t localhost/x-monorepo/{{.ITEM}}:kind {{.BIN_DIR}}/kind >/dev/null'
+      # The console: nginx + web/apps/console/dist (built by the web-build dep), context = that dir.
+      - '{{.DOCKER}} build -q -t localhost/x-monorepo/console:kind web/apps/console >/dev/null'
+      - '{{.DOCKER}} save -o {{.BIN_DIR}}/kind/images.tar localhost/x-monorepo/rpc:kind localhost/x-monorepo/catalog-rpc:kind localhost/x-monorepo/payment-rpc:kind localhost/x-monorepo/payment-worker:kind localhost/x-monorepo/worker:kind localhost/x-monorepo/migrate:kind localhost/x-monorepo/console:kind'
+      - '{{.KIND_RUN}} kind load image-archive --name {{.CLUSTER}} {{.BIN_DIR}}/kind/images.tar'
+      - '{{.KIND_RUN}} kubectl --kubeconfig "{{.KIND_KUBECONFIG}}" -n {{.NS}} apply -f {{.KIND_DIR}}/deps.yaml >/dev/null'
+      # Dex dev IdP: same config file as compose (one source for issuer / client / accounts), and a
+      # CoreDNS rewrite so dex.localtest.me resolves to it inside the cluster (docs/operations.md).
+      - '{{.KIND_RUN}} kubectl --kubeconfig "{{.KIND_KUBECONFIG}}" -n {{.NS}} create configmap dex --from-file=config.yaml=deployments/docker/dex/config.yaml --dry-run=client -o yaml | {{.KIND_RUN}} kubectl --kubeconfig "{{.KIND_KUBECONFIG}}" apply -f - >/dev/null'
+      - '{{.KIND_RUN}} kubectl --kubeconfig "{{.KIND_KUBECONFIG}}" -n {{.NS}} apply -f {{.KIND_DIR}}/dex.yaml >/dev/null'
+      - '{{.KIND_RUN}} {{.KIND_DIR}}/coredns-dex.sh {{.NS}}'
+      - '{{.KIND_RUN}} kubectl --kubeconfig "{{.KIND_KUBECONFIG}}" -n {{.NS}} rollout status deploy/postgres deploy/redis deploy/dex --timeout=2m'
+    preconditions:
+      - sh: command -v kind >/dev/null && command -v kubectl >/dev/null && command -v helm >/dev/null && command -v jq >/dev/null
+        msg: needs kind, kubectl, helm, jq (brew install kind kubectl helm jq)
+      - sh: test -n "{{.KIND_TARGET_OK}}"
+        msg: CLUSTER, NS and KEDA_NS must be lowercase letters, digits, '.' or '-' and start with a letter or digit
+
+  helm-kind:
+    desc: 'both halves on one cluster, one after the other (what a laptop runs; CI runs helm-kind-core and helm-kind-payment as two jobs on two clusters): helm-kind-core, then helm-kind-payment. helm-kind-up runs once. Each half installs the release itself and seeds its own data, so either can be run alone on a fresh cluster. helm-kind-down deletes the cluster'
+    cmds:
+      - task: helm-kind-core
+      - task: helm-kind-payment
+      - '{{.KIND_RUN}} helm --kubeconfig "{{.KIND_KUBECONFIG}}" -n {{.NS}} status x-monorepo | head -5'
+    preconditions:
+      - sh: command -v kind >/dev/null && command -v kubectl >/dev/null && command -v helm >/dev/null && command -v jq >/dev/null
+        msg: needs kind, kubectl, helm, jq (brew install kind kubectl helm jq)
+      - sh: test -n "{{.KIND_TARGET_OK}}"
+        msg: CLUSTER, NS and KEDA_NS must be lowercase letters, digits, '.' or '-' and start with a letter or digit
+
+  helm-kind-core:
+    deps: [helm-kind-up]
+    desc: 'the chart installed for real on the helm-kind-up cluster, without payment: helm upgrade --install --wait twice (pre-install then pre-upgrade hook), each followed by deployments/helm/kind/smoke.sh (an order reserves stock through the worker; the console serves the UI and proxies /api); then negative.sh (catalog-rpc on a Secret that cannot make it durable) and outage.sh (rpc without its catalog). Needs nothing another task left on the cluster; independent of helm-kind-payment (CI runs both in parallel on separate clusters)'
+    vars:
+      CHART: deployments/helm/x-monorepo
+      KIND_DIR: deployments/helm/kind
+    cmds:
+      - '{{.KIND_RUN}} helm --kubeconfig "{{.KIND_KUBECONFIG}}" upgrade --install x-monorepo {{.CHART}} -n {{.NS}} -f {{.KIND_DIR}}/values.yaml --wait --timeout 3m >/dev/null'
+      - '{{.KIND_RUN}} {{.KIND_DIR}}/smoke.sh {{.NS}} x-monorepo'
+      # Second pass is an upgrade: pre-upgrade hook re-runs migrate (no-op), pods roll, release stays ready.
+      - '{{.KIND_RUN}} helm --kubeconfig "{{.KIND_KUBECONFIG}}" upgrade --install x-monorepo {{.CHART}} -n {{.NS}} -f {{.KIND_DIR}}/values.yaml --wait --timeout 3m >/dev/null'
+      - '{{.KIND_RUN}} {{.KIND_DIR}}/smoke.sh {{.NS}} x-monorepo'
+      # catalog-rpc on a Secret that cannot make it durable: no start (missing key) / exit (empty URL). Restores the release.
+      - '{{.KIND_RUN}} {{.KIND_DIR}}/negative.sh {{.NS}} x-monorepo {{.CHART}} {{.KIND_DIR}}/values.yaml'
+      # rpc without its catalog: the wait is best effort, CreateOrder / SetStock answer UNAVAILABLE and write nothing, recovery needs no restart.
+      - '{{.KIND_RUN}} {{.KIND_DIR}}/outage.sh {{.NS}} x-monorepo {{.CHART}} {{.KIND_DIR}}/values.yaml'
+      - '{{.KIND_RUN}} helm --kubeconfig "{{.KIND_KUBECONFIG}}" -n {{.NS}} status x-monorepo | head -5'
+    preconditions:
+      - sh: command -v kind >/dev/null && command -v kubectl >/dev/null && command -v helm >/dev/null && command -v jq >/dev/null
+        msg: needs kind, kubectl, helm, jq (brew install kind kubectl helm jq)
+      - sh: test -n "{{.KIND_TARGET_OK}}"
+        msg: CLUSTER, NS and KEDA_NS must be lowercase letters, digits, '.' or '-' and start with a letter or digit
+
+  helm-kind-payment:
+    deps: [helm-kind-up]
+    desc: 'payment on the helm-kind-up cluster: the chart installed (helm upgrade --install --wait, kind/values.yaml), then payment.sh (the three payment-rpc workloads, the webhook-only Ingress and its rate limit, orders unaffected with payment-rpc stopped) and payment-flow.sh (the whole payment flow with ordering.require_payment on: every race of docs/payment.md §5, the TTL sequence, the switch both ways, payment-rpc stopped). Needs nothing another task left on the cluster (the scripts seed their own products and stock); independent of helm-kind-core (CI runs both in parallel on separate clusters)'
+    vars:
+      CHART: deployments/helm/x-monorepo
+      KIND_DIR: deployments/helm/kind
+    cmds:
+      - '{{.KIND_RUN}} helm --kubeconfig "{{.KIND_KUBECONFIG}}" upgrade --install x-monorepo {{.CHART}} -n {{.NS}} -f {{.KIND_DIR}}/values.yaml --wait --timeout 3m >/dev/null'
+      # payment-rpc and payment-worker: serve / consume / an expire run, the webhook-only Ingress (ingress-nginx is installed there) with its rate limit, and orders reaching CONFIRMED with payment-rpc stopped. Restores the release.
+      - '{{.KIND_RUN}} {{.KIND_DIR}}/payment.sh {{.NS}} x-monorepo'
+      # the whole payment flow with ordering.require_payment ON (kind/payment-flow-values.yaml: auth required, two static keys, payment-rpc's mock control): create -> reserved -> CONFIRMED -> StartPayment -> paid -> webhook -> COMPLETED, delayed / repeated / foreign notifications, the customer cancelling and the window running out with the money arriving late (refunded), the reservation-TTL sequence with the provider down, the switch on -> off -> on, payment-rpc stopped. Restores the release.
+      - '{{.KIND_RUN}} {{.KIND_DIR}}/payment-flow.sh {{.NS}} x-monorepo {{.CHART}} {{.KIND_DIR}}/values.yaml {{.KIND_DIR}}/payment-flow-values.yaml'
+      - '{{.KIND_RUN}} helm --kubeconfig "{{.KIND_KUBECONFIG}}" -n {{.NS}} status x-monorepo | head -5'
+    preconditions:
+      - sh: command -v kind >/dev/null && command -v kubectl >/dev/null && command -v helm >/dev/null && command -v jq >/dev/null
+        msg: needs kind, kubectl, helm, jq (brew install kind kubectl helm jq)
+      - sh: test -n "{{.KIND_TARGET_OK}}"
+        msg: CLUSTER, NS and KEDA_NS must be lowercase letters, digits, '.' or '-' and start with a letter or digit
+
+  helm-kind-keda:
+    deps: [helm-kind-up]
+    desc: 'on the helm-kind-up cluster (independent of the other helm-kind tasks, CI runs them in parallel): KEDA + deployments/helm/kind/monitoring.yaml (OTLP collector → Prometheus), the chart re-installed with kind/keda-values.yaml (worker.autoscaling lag), then kind/scale.sh floods orders with k6 and expects the worker to scale out on eventbus_consumer_lag and back'
+    vars:
+      CHART: deployments/helm/x-monorepo
+      KIND_DIR: deployments/helm/kind
+      KEDA_VERSION: 2.21.0
+    cmds:
+      - '{{.KIND_RUN}} helm repo add kedacore https://kedacore.github.io/charts >/dev/null 2>&1 || true'
+      - '{{.KIND_RUN}} helm --kubeconfig "{{.KIND_KUBECONFIG}}" upgrade --install keda kedacore/keda -n {{.KEDA_NS}} --create-namespace --version {{.KEDA_VERSION}} --wait --timeout 3m >/dev/null'
+      - '{{.KIND_RUN}} kubectl --kubeconfig "{{.KIND_KUBECONFIG}}" -n {{.NS}} apply -f {{.KIND_DIR}}/monitoring.yaml >/dev/null'
+      - '{{.KIND_RUN}} kubectl --kubeconfig "{{.KIND_KUBECONFIG}}" -n {{.NS}} rollout status deploy/otel-collector deploy/prometheus --timeout=2m'
+      - '{{.KIND_RUN}} helm --kubeconfig "{{.KIND_KUBECONFIG}}" upgrade --install x-monorepo {{.CHART}} -n {{.NS}} -f {{.KIND_DIR}}/values.yaml -f {{.KIND_DIR}}/keda-values.yaml --wait --timeout 3m >/dev/null'
+      - '{{.KIND_RUN}} {{.KIND_DIR}}/scale.sh {{.NS}} x-monorepo'
+    preconditions:
+      - sh: command -v k6 >/dev/null && command -v jq >/dev/null
+        msg: needs k6 and jq
+      - sh: test -n "{{.KIND_TARGET_OK}}"
+        msg: CLUSTER, NS and KEDA_NS must be lowercase letters, digits, '.' or '-' and start with a letter or digit
+
+  helm-kind-down:
+    desc: delete the kind cluster created by helm-kind (CLUSTER=<name> for another one, default x-monorepo)
+    cmds:
+      # --kubeconfig is not optional: without it kind reads $KUBECONFIG, then ~/.kube/config, and removes the kind-<CLUSTER> context from it
+      - '{{.KIND_RUN}} kind delete cluster --name {{.CLUSTER}} --kubeconfig "{{.KIND_KUBECONFIG}}"'
+      - rm -f "{{.KIND_KUBECONFIG}}"
+      - rm -rf "{{.BIN_DIR}}/kind/helm-{{.CLUSTER}}"
+    preconditions:
+      - sh: test -n "{{.KIND_TARGET_OK}}"
+        msg: CLUSTER, NS and KEDA_NS must be lowercase letters, digits, '.' or '-' and start with a letter or digit
+
+  k6:
+    desc: 'one k6 script against a running server (default http://127.0.0.1:8080, i.e. task run): task k6 -- orders|ratelimit|timeout|reservation [k6 args…]; BASE_URL / API_KEY / ADMIN_API_KEY (setup SetStock, admin role when auth is on) / VUS / DURATION / RPS are read from the environment (k6 __ENV), see the headers of tests/k6/*.js'
+    cmds:
+      - 'k6 run tests/k6/{{index (splitArgs .CLI_ARGS) 0}}.js {{slice (splitArgs .CLI_ARGS) 1 | join " "}}'
+    preconditions:
+      - sh: command -v k6 >/dev/null
+        msg: k6 not found (brew install k6)
+
+  k6-auth-matrix:
+    desc: 'tests/k6/auth-matrix.sh: orders.js and reservation.js (2 VU, 5s) against a real ./bin/rpc + ./bin/catalog-rpc + ./bin/worker + Postgres (DATABASE_URL) in every auth state — auth on with a role-less key / an admin key, auth off with no key / a key sent — plus the per-procedure-public and fails-once fixtures. Each cell has its own RUN_ID; task k6-auth-matrix -- <cell…> runs some; K6_AUTH_LIST=1 prints the cell names and K6_AUTH_SHARD=<i>/<n> runs one shard (CI: 3 legs, each on its own runner and Postgres). The `k6-auth` job in CI'
+    cmds: ['tests/k6/auth-matrix.sh {{.BIN_DIR}} {{.CLI_ARGS}}']
+    preconditions:
+      - sh: command -v k6 >/dev/null && command -v python3 >/dev/null
+        msg: needs k6 (brew install k6) and python3
+
+  k6-wire:
+    desc: 'tests/k6/wire.sh: the four k6 scripts against tests/k6/wire_server.py, which answers with a broken HTTP response (status code / version / header line / chunk quoting the request X-API-Key, a truncated body, a closed connection) — each run must fail, and the key must be in none of k6 output, --summary-export or --out json (no Postgres, no rpc; the cells run WIRE_JOBS=4 at a time, lane L on port 18190 + 10 L, ~25 s). The `k6-wire` job in CI'
+    cmds: ['tests/k6/wire.sh {{.BIN_DIR}} {{.CLI_ARGS}}']
+    preconditions:
+      - sh: command -v k6 >/dev/null && command -v python3 >/dev/null
+        msg: needs k6 (brew install k6) and python3
+
+  k6-parallel-test:
+    desc: 'tests/k6/parallel_test.sh: smoke.sh (stub rpc / worker / catalog-rpc, shim k6) and wire.sh must stay red when one parallel member fails — each smoke script failing alone, a k6 that exits 0 or dies without writing its files, a lane that dies without a verdict, and every external command (grep, cat, sleep, rm, mkdir, env, curl, tee, python3…) exiting 42 after partial or full output (#451, #463). Needs k6 and python3; no Postgres. The `k6-wire` job in CI'
+    cmds: ['tests/k6/parallel_test.sh']
+    preconditions:
+      - sh: command -v k6 >/dev/null && command -v python3 >/dev/null
+        msg: needs k6 (brew install k6) and python3
+
+  k6-bench:
+    desc: 'tests/k6/bench.sh: the performance baseline (#263) — CreateOrder throughput/latency at saturation and order → RESERVED latency through the worker, RUNS (3) times with fixed parameters, each run in its own Postgres database (created on the server of DATABASE_URL, migrated, dropped after). Writes {{.BIN_DIR}}/k6-bench/<stamp>/{result.json,summary.md} (median, min–max, CV; commit, Go/Postgres/k6, CPU, parameters). Needs psql and CREATE DATABASE. Not in CI: docs/perf-baseline.md'
+    deps: [build]
+    cmds: ['tests/k6/bench.sh {{.BIN_DIR}} {{.CLI_ARGS}}']
+    preconditions:
+      - sh: command -v k6 >/dev/null && command -v psql >/dev/null && command -v python3 >/dev/null
+        msg: needs k6 (brew install k6), psql and python3
+
+  k6-bench-test:
+    desc: 'tests of the bench tooling: bench_report_test.py (throughput and drain definitions), bench_fixture_test.sh (seeded SKUs, end-to-end latency includes CreateOrder, throughput not diluted by setup — against tests/k6/bench_stub.py), bench_db_test.sh (bench.sh never drops a database it did not create). Needs Postgres (DATABASE_URL), k6 and psql; not in CI'
+    deps: [build]
+    cmds:
+      - 'python3 -I tests/k6/bench_report_test.py'
+      - 'tests/k6/bench_fixture_test.sh'
+      - 'tests/k6/bench_drain_test.sh'
+      - 'tests/k6/bench_overload_test.sh'
+      - 'tests/k6/bench_db_test.sh {{.BIN_DIR}}'
+    preconditions:
+      - sh: command -v k6 >/dev/null && command -v psql >/dev/null && command -v python3 >/dev/null
+        msg: needs k6 (brew install k6), psql and python3
+
+  k6-smoke:
+    desc: 'tests/k6/smoke.sh: the four k6 scripts, short, each against its own ./bin/rpc (reservation first and alone on :18090, then orders / ratelimit / timeout together on :18100 / :18110 / :18120) with the local Postgres (DATABASE_URL), a ./bin/catalog-rpc beside each (rpc has no catalog of its own) — load thresholds, rate limit at 50 rps, timeout at 1ns, reservation with a ./bin/worker next to the rpc. What CI runs'
+    deps: [build]
+    cmds: ['tests/k6/smoke.sh {{.BIN_DIR}} {{.CLI_ARGS}}']
+    preconditions:
+      - sh: command -v k6 >/dev/null
+        msg: k6 not found (brew install k6)
+
+  release-check:
+    desc: validate .goreleaser.yaml (goreleaser from PATH; brew install goreleaser)
+    cmds: [goreleaser check]
+
+  release-snapshot:
+    desc: 'dry-run release into bin/dist: every binary + archive, no images (needs docker buildx), no signing (needs the CI OIDC token), no publish'
+    cmds: ["goreleaser release --snapshot --clean --skip=docker,publish,sign"]
+
+  release-gate:
+    desc: 'what release.yml would do with HEAD: the files changed since the last v* tag that reach an artifact (scripts/releasable.sh; none = no release) and the version release-drafter would resolve from the commit titles (scripts/next-version.sh)'
+    silent: true
+    cmds:
+      - |
+        files=$(scripts/releasable.sh {{.CLI_ARGS}})
+        if [ -z "$files" ]; then echo "no release: nothing releasable in that range"; exit 0; fi
+        echo "$files"
+        echo "→ release $(scripts/next-version.sh {{.CLI_ARGS}})"
+
+  release-verify:
+    desc: 'scripts/release-verify.sh vX.Y.Z: verify a published release the way its notes say (checksums bundle, archive attestation, the signature of every image the release ships; needs gh + cosign + ghcr login)'
+    cmds:
+      - scripts/release-verify.sh {{.CLI_ARGS}}
+
+  run:
+    desc: 'build and run ./bin/rpc with configs/local.yaml (gitignored; seeded from the example); task run CONFIG=<file> to use another. It asks the catalog service for prices: run `task catalog-rpc` in another terminal first (rpc does not start without a catalog upstream)'
+    deps: [build, config]
+    env:
+      APP_CATALOG_UPSTREAM: 'http://127.0.0.1:{{.CATALOG_PORT}}'
+      APP_CATALOG_API_KEY: '{{.CATALOG_DEV_KEY}}'
+    cmds: ['export APP_CONFIG={{shellQuote .CONFIG}}; {{.BIN_DIR}}/rpc']
+
+  catalog-config:
+    desc: 'create configs/catalog-rpc.yaml from configs/catalog-rpc.example.yaml if missing'
+    status: ['test -f {{shellQuote .CATALOG_CONFIG}}']
+    cmds:
+      - cp configs/catalog-rpc.example.yaml {{shellQuote .CATALOG_CONFIG}}
+      - 'echo seeded {{shellQuote .CATALOG_CONFIG}} "from configs/catalog-rpc.example.yaml — edit it, it is gitignored"'
+
+  catalog-rpc:
+    desc: 'build and run ./bin/catalog-rpc with configs/catalog-rpc.yaml (gitignored; seeded from configs/catalog-rpc.example.yaml; CATALOG_CONFIG=<file> to use another), the way `task run` runs rpc with configs/local.yaml: the port, auth (the one dev key rpc=…:admin), Postgres, log and OTLP are all in that file, which never reads configs/local.yaml (OIDC, JWT, your keys). Env beats the file, as for `task run`. Needs `task migrate -- up` first (the catalog schema)'
+    deps: [build, catalog-config]
+    cmds: ['export APP_CONFIG={{shellQuote .CATALOG_CONFIG}}; {{.BIN_DIR}}/catalog-rpc --require-durable']
+
+  payment-config:
+    desc: 'create configs/payment-rpc.yaml from configs/payment-rpc.example.yaml if missing'
+    status: ['test -f {{shellQuote .PAYMENT_CONFIG}}']
+    cmds:
+      - cp configs/payment-rpc.example.yaml {{shellQuote .PAYMENT_CONFIG}}
+      - 'echo seeded {{shellQuote .PAYMENT_CONFIG}} "from configs/payment-rpc.example.yaml — edit it, it is gitignored"'
+
+  payment-rpc:
+    desc: 'build and run ./bin/payment-rpc serve with configs/payment-rpc.yaml (gitignored; seeded from configs/payment-rpc.example.yaml; PAYMENT_CONFIG=<file> to use another), the way `task catalog-rpc` runs catalog-rpc: the port (:8082), auth (the one dev key rpc=…:admin), Postgres, log, OTLP and the mock provider are all in that file, which never reads configs/local.yaml. Nothing calls it yet (rpc forwards to it in a later slice). Needs `task migrate -- up` first (the payment schema)'
+    deps: [build, payment-config]
+    cmds: ['export APP_CONFIG={{shellQuote .PAYMENT_CONFIG}}; {{.BIN_DIR}}/payment-rpc serve --require-durable']
+
+  payment-worker:
+    desc: 'build and run ./bin/payment-worker --require-durable with the same file `task payment-rpc` loads (configs/payment-rpc.yaml, gitignored, seeded from configs/payment-rpc.example.yaml; PAYMENT_CONFIG=<file> to use another): payment''s event consumer (OrderConfirmed / OrderCancelled / OrderCompleted, refunds, webhooks), so with ordering.require_payment on a confirmed order gets its payment. Needs Postgres (`task migrate -- up` first: ordering and payment schemas) and the same mock_webhook_secret as `task payment-rpc`. Like every task that reads a config file, it exports APP_CONFIG in the command, so an APP_CONFIG already in your environment does not win over PAYMENT_CONFIG (scripts/task-config-test.sh); other APP_* variables already in your environment still override the file'
+    deps: [build, payment-config]
+    cmds:
+      - 'export APP_CONFIG={{shellQuote .PAYMENT_CONFIG}}; {{shellQuote .BIN_DIR}}/payment-worker --require-durable'
+
+  worker:
+    desc: 'build and run ./bin/worker (event consumers) with configs/local.yaml; needs postgres.url'
+    deps: [build, config]
+    cmds: ['export APP_CONFIG={{shellQuote .CONFIG}}; {{.BIN_DIR}}/worker']
+
+  poison:
+    desc: 'task poison -- list|show|requeue|drop … → operate a BC''s poison table via ./bin/worker poison (task poison -- --help)'
+    deps: [build, config]
+    preconditions:
+      - sh: test -n "{{.CLI_ARGS}}"
+        msg: 'usage: task poison -- list [-n 50] [<bc>] | show <bc> <offset> | requeue <bc> <offset>...|all | drop <bc> <offset>...|all'
+    cmds: ['export APP_CONFIG={{shellQuote .CONFIG}}; {{.BIN_DIR}}/worker poison {{.CLI_ARGS}}']
+
+  expire:
+    desc: 'task expire -- --older-than 24h [--dry-run] [--batch N] → reservation TTL: release RESERVED reservations held longer than this and ask ordering to cancel, via ./bin/worker expire'
+    deps: [build, config]
+    preconditions:
+      - sh: test -n "{{.CLI_ARGS}}"
+        msg: 'usage: task expire -- --older-than <duration> [--dry-run] [--batch N]   (start with --dry-run)'
+    cmds: ['export APP_CONFIG={{shellQuote .CONFIG}}; {{.BIN_DIR}}/worker expire {{.CLI_ARGS}}']
+
+  bootstrap:
+    desc: 'task bootstrap [-- --name root --role admin --key-name bootstrap --expires-in 720h] → identity''s first account + API key on an empty store, secret printed once, via ./bin/worker bootstrap (local development database only: --insecure-allow-plaintext skips the TLS check; --expect-target pins the compose Postgres, 127.0.0.1:$POSTGRES_PORT, default 5432)'
+    deps: [build, config]
+    cmds: ['export APP_CONFIG={{shellQuote .CONFIG}}; {{.BIN_DIR}}/worker bootstrap --insecure-allow-plaintext --expect-target "127.0.0.1:${POSTGRES_PORT:-5432}" {{.CLI_ARGS}}']
+
+  dex-prebind:
+    desc: 'ADMIN_API_KEY=<admin key> task dex-prebind → binds the dev Dex accounts (admin@example.com with the admin role, user@example.com with none) through CreateInvite → ClaimInvite; rerunnable, dev Dex issuer and a local rpc only (scripts/dex-prebind.sh, docs/operations.md "Dex dev IdP")'
+    cmds: ['scripts/dex-prebind.sh']
+
+  prune:
+    desc: 'task prune -- --older-than 720h [--dry-run] [--unconsumed] [<bc>] → delete acked outbox rows + consumed inbox rows via ./bin/worker prune'
+    deps: [build, config]
+    preconditions:
+      - sh: test -n "{{.CLI_ARGS}}"
+        msg: 'usage: task prune -- --older-than <duration> [--dry-run] [--unconsumed] [<bc>]   (start with --dry-run)'
+    cmds: ['export APP_CONFIG={{shellQuote .CONFIG}}; {{.BIN_DIR}}/worker prune {{.CLI_ARGS}}']
+
+  # ── Web (web/: pnpm + Turborepo) ────────────────────────────────────────────
+
+  web-install:
+    desc: 'pnpm install for web/ (frozen lockfile); re-runs only when the lockfile or a package.json changes'
+    dir: web
+    sources: [pnpm-lock.yaml, package.json, '*/*/package.json']
+    generates: [node_modules/.modules.yaml]
+    cmds: [pnpm install --frozen-lockfile]
+
+  web-dev:
+    desc: 'console on http://localhost:5173, proxying RPCs to CONSOLE_API (default http://localhost:8080 = task run)'
+    deps: [web-install]
+    dir: web/apps/console
+    cmds: [pnpm dev]
+
+  web-typecheck:
+    desc: tsc --noEmit for every web package (@repo/proto, @repo/console)
+    deps: [web-install]
+    dir: web
+    cmds: [pnpm typecheck]
+
+  web-test:
+    desc: 'unit tests of the console (node --test, no browser): the retry policy (src/transient.test.ts: a row per Connect code, the network-error shapes, the bounded backoff), what it does to every query once react-query merged it with the query''s own options (src/queries.retry.test.ts: the real QueryClient defaults and queryFns, a scripted server, a mocked clock), and the static guard that nothing else sets `retry` (src/retry-overrides.test.ts). What CI''s web job runs with web-typecheck'
+    deps: [web-install]
+    dir: web/apps/console
+    # src/testing/register.mjs: vite-style imports, enums and the browser-only client.ts do not load in plain node
+    cmds: [node --test --experimental-strip-types --import ./src/testing/register.mjs src/*.test.ts]
+
+  web-build:
+    desc: production build of web/apps/console → web/apps/console/dist
+    deps: [web-install]
+    dir: web
+    cmds: [pnpm build]
+
+  web-e2e:
+    desc: 'Playwright smoke of the console against a real ./bin/rpc + vite preview of the build; E2E_DATABASE_URL=postgres://… runs migrate up and uses that DB (what CI does), unset = in-memory; once: pnpm exec playwright install chromium (web/apps/console)'
+    deps: [build, web-build]
+    dir: web/apps/console
+    cmds: ['pnpm exec playwright test {{.CLI_ARGS}}']
+
+  web-e2e-shards-check:
+    desc: 'CI console-e2e shards (#447): `playwright test --list --shard=i/N` for i in 1..N, together, must be exactly the unsharded --list (same test ids, none twice, none missing; a --list that exits non-zero or prints fewer tests than its own Total fails). Usage: task web-e2e-shards-check -- 3. Lists only, starts no server. Run with E2E_DEX=1 to include the oidc-dex project, as CI does. scripts/web-e2e-shards-check.sh, pinned by scripts/test.sh'
+    deps: [web-install]
+    dir: web/apps/console
+    cmds: ['../../../scripts/web-e2e-shards-check.sh {{.CLI_ARGS}}']
+
+  web-e2e-payment:
+    desc: 'the "payment" Playwright project (playwright.payment.config.ts): the console against the REAL payment stack, nothing scripted with page.route. e2e/payment/stack-server.ts makes a database of its own on the server E2E_DATABASE_URL names (needs psql), migrates it and runs catalog-rpc, payment-rpc serve + consume, rpc and worker (ordering.require_payment on, switched back off by the spec); the spec orders in the console, presses Pay (a new tab on the mock checkout address), pays through `payment-rpc mock pay`, and expects COMPLETED, the card gone and the polling stopped. What CI''s console-e2e job runs after the default-port run'
+    deps: [build, web-build]
+    dir: web/apps/console
+    preconditions:
+      - sh: test -n "$E2E_DATABASE_URL"
+        msg: 'E2E_DATABASE_URL is required: a Postgres server the stack may create a database on, e.g. postgres://app:app@127.0.0.1:5432/app?sslmode=disable'
+      - sh: command -v psql >/dev/null
+        msg: needs psql (the stack creates and drops its own database with it)
+    cmds:
+      # Set in the shell, not in `env:`: an inherited E2E_*_PORT / CI cannot change what is tested. CI=1 so no webServer
+      # reuses one somebody else started. The cleanup check runs whether the tests passed or not.
+      - |
+        export CI=1
+        unset E2E_DEX E2E_CONSOLE_URL
+        # The default config (task web-e2e, web-e2e-image) must not pick these specs up: without their stack they cannot pass
+        # (CI found exactly that on the first push). Listing is enough to know (paths are relative to testDir); it starts no server.
+        if pnpm exec playwright test --list 2>/dev/null | grep -qE '› payment/'; then
+          echo "playwright.config.ts would run e2e/payment/ without its stack: add payment to its testIgnore"; exit 1
+        fi
+        rc=0
+        pnpm exec playwright test -c playwright.payment.config.ts {{.CLI_ARGS}} || rc=$?
+        node --experimental-strip-types e2e/assert-clean.ts || rc=1
+        exit $rc
+
+  web-e2e-image:
+    desc: 'the "image" Playwright project against the real console image: build web/apps/console/Dockerfile (docker or podman), run it with RPC_UPSTREAM back to the host, Playwright starts bin/rpc as usual. Only the specs that need nginx run here (e2e/image-specs.ts: e2e/image.spec.ts for SPA fallback, cache headers, /api proxy, /healthz, /config.json, CSP, plus a smoke of each route family); the rest run on vite preview in console-e2e. Before the build, e2e/image-specs.check.ts fails on a spec nobody classified or an image set that is not the pinned one (e2e/image-specs.selftest.ts proves it can fail). What CI''s console-image job runs'
+    deps: [build, web-build]
+    cmds:
+      - node --test --experimental-strip-types web/apps/console/e2e/image-specs.selftest.ts
+      - cd web/apps/console && node --experimental-strip-types e2e/image-specs.check.ts
+      - web/apps/console/e2e/image.sh {{.CLI_ARGS}}
+
+  web-e2e-image-mutants:
+    desc: 'fault injection for task web-e2e-image (#449): builds the console image from a copy of its context with ONE broken nginx setting (SPA fallback, /api proxy, CSP, /config.json, asset MIME) and runs the image project against it; every mutant must turn it red and the unmodified control green (e2e/image-mutants.sh; a run that did not finish, or a parsing stage that failed, reads ERROR, never RED: e2e/image-mutants.selftest.ts proves it first). Not part of CI: it is the proof that the specs left on the image can fail'
+    deps: [build, web-build]
+    cmds:
+      # The verdict logic proves it can fail first (fakes of sed / grep / sort / uniq / awk / image.sh that fail half way must read ERROR, never RED)
+      - node --test --experimental-strip-types web/apps/console/e2e/image-mutants.selftest.ts
+      - web/apps/console/e2e/image-mutants.sh {{.CLI_ARGS}}
+
+  web-e2e-ports:
+    desc: 'the Console OIDC e2e fixtures follow E2E_RPC_PORT / E2E_WEB_PORT (#383): the tests tagged @ports (real-backend claim and issuer-mismatch negative, the two logout cases, the own-origin token-endpoint case) on a NON-default port pair, CI=1 so no webServer reuses someone else''s, then checks that every derived port is closed on every loopback (127.0.0.1 and ::1) and the generated rpc config is gone (e2e/assert-clean.ts, which e2e/assert-clean.selftest.ts proves against IPv4, IPv6 and a real vite preview first, on ports of its own, two runs side by side in e2e/assert-clean.parallel.selftest.ts, a bind that fails must not pass as a skip in e2e/assert-clean.fault.selftest.ts). Not the RevokeSessions cache wait. What CI''s console-e2e job runs after the default-port run'
+    deps: [build, web-build]
+    dir: web/apps/console
+    cmds:
+      # Set in the shell, not in `env:`, so an inherited E2E_*_PORT / CI cannot change what is tested.
+      # The cleanup check runs whether the tests passed or not: every derived port closed and the generated rpc config gone.
+      - |
+        export CI=1 E2E_RPC_PORT=19511 E2E_WEB_PORT=4511
+        unset E2E_DATABASE_URL E2E_DEX E2E_CONSOLE_URL
+        rc=0
+        # The cleanup check checked first: it must see IPv4, IPv6 and a real vite preview (e2e/assert-clean.selftest.ts).
+        node --test --experimental-strip-types e2e/assert-clean.selftest.ts e2e/assert-clean.parallel.selftest.ts e2e/assert-clean.fault.selftest.ts || exit 1
+        pnpm exec playwright test --project=auth --project=oidc-backend --grep @ports {{.CLI_ARGS}} || rc=$?
+        node --experimental-strip-types e2e/assert-clean.ts || rc=1
+        exit $rc
+
+  web-e2e-dex:
+    desc: 'the oidc-dex Playwright project: the console signs in through the real dev Dex (compose service dex, started here if it is not up) against a real ./bin/rpc whose only OIDC issuer is that Dex; binding goes through CreateInvite + ClaimInvite. Needs dex.localtest.me to resolve (public DNS, or /etc/hosts offline: docs/operations.md "Dex dev IdP"). Other CI runs it with E2E_DEX=1 task web-e2e'
+    deps: [build, web-build]
+    dir: web/apps/console
+    cmds:
+      - '{{.COMPOSE}} -f ../../../deployments/docker/docker-compose.yaml up -d dex'
+      - for _ in $(seq 30); do curl -fsS http://dex.localtest.me:5556/dex/.well-known/openid-configuration >/dev/null && exit 0; sleep 1; done; echo "dex.localtest.me:5556 did not come up (DNS? docs/operations.md)" >&2; exit 1
+      - E2E_DEX=1 pnpm exec playwright test --project oidc-dex {{.CLI_ARGS}}
+
+  config:
+    desc: 'create configs/local.yaml from configs/config.example.yaml if missing'
+    status: ['test -f {{shellQuote .CONFIG}}']
+    cmds:
+      - cp configs/config.example.yaml {{shellQuote .CONFIG}}
+      - 'echo seeded {{shellQuote .CONFIG}} "from configs/config.example.yaml — edit it, it is gitignored"'
+
+  migrate:
+    desc: 'task migrate -- up|down|version → every BC''s migrations against postgres.url of configs/local.yaml (or CONFIG=<file> / APP_POSTGRES_URL)'
+    deps: [config]
+    preconditions:
+      - sh: test -n "{{.CLI_ARGS}}"
+        msg: 'usage: task migrate -- up|down|version'
+    cmds:
+      - 'export APP_CONFIG={{shellQuote .CONFIG}}; go run ./apps/migrate {{.CLI_ARGS}}'
+
+  # ── Local infrastructure ────────────────────────────────────────────────────
+
+  compose-up:
+    desc: 'start local infra (Postgres :5432 user/pass/db=app; otel-lgtm: Grafana :3000, OTLP :4317) — apps run on the host'
+    cmds:
+      - '{{.COMPOSE}} -f deployments/docker/docker-compose.yaml up -d'
+
+  grafana-reload:
+    desc: restart otel-lgtm so Grafana re-reads deployments/docker/grafana/{dashboards/*.json,provisioning/alerting.yaml}
+    cmds:
+      - '{{.COMPOSE}} -f deployments/docker/docker-compose.yaml restart lgtm'
+
+  compose-down:
+    desc: stop local infra and drop its volume
+    cmds:
+      - '{{.COMPOSE}} -f deployments/docker/docker-compose.yaml down -v'
+
+  # ── Modules ─────────────────────────────────────────────────────────────────
+
+  rename:
+    desc: 'task rename -- github.com/you/repo → rewrite the module path everywhere, then regenerate'
+    preconditions:
+      - sh: test -n "{{.CLI_ARGS}}"
+        msg: 'usage: task rename -- <new module prefix, e.g. github.com/you/repo>'
+    cmds:
+      - scripts/rename.sh {{.CLI_ARGS}}
+      - task: gen
+      - task: wire
+      - task: tidy
+
+  sync:
+    desc: push workspace build list into every go.mod (run after adding deps)
+    cmds: [go work sync]
+
+  tidy:
+    desc: go mod tidy in every module, then go work sync
+    cmds:
+      - for: { var: MODULES, split: "\n" }
+        cmd: cd {{shellQuote .ITEM}} && go mod tidy
+      - go work sync
+
+  clean:
+    cmds:
+      - rm -rf {{.BIN_DIR}}

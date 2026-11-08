@@ -1,0 +1,115 @@
+# release-drafter (v7) drafts the next GitHub Release: every PR merged since the last published
+# release is filed by its Conventional Commits title (`when.conventional` parses the title; no labels),
+# and the next version comes from the matching category's semver-increment:
+# `!` → major, feat → minor, everything else → patch.
+# Run by .github/workflows/release.yml (prepare job) after every green CI on main; the same
+# workflow then fills the draft with goreleaser and publishes it. Nobody tags by hand.
+# The autolabeler block at the bottom is used by .github/workflows/labeler.yml alone
+# (pull_request_target): labels are for the PR list, nothing here reads them.
+# sync-labels: a label from a rule that no longer matches is removed again.
+sync-labels: true
+name-template: "v$RESOLVED_VERSION"
+tag-template: "v$RESOLVED_VERSION"
+
+categories:
+  - type: pre-exclude
+    when:
+      conventional: { types: [test] }
+  - title: "⚠️ Breaking"
+    semver-increment: major
+    exclusive: true
+    when:
+      conventional: { breaking: true }
+  - title: "🚀 Features"
+    semver-increment: minor
+    exclusive: true
+    when:
+      conventional: { type: feat }
+  - title: "🐛 Bug fixes"
+    exclusive: true
+    when:
+      conventional: { type: fix }
+  - title: "📦 Dependencies"
+    exclusive: true
+    collapse-after: 5
+    when:
+      conventional: { type: build, scope: deps }
+  - title: "🧰 Maintenance"
+    exclusive: true
+    when:
+      conventional: { types: [chore, refactor, perf, ci, build] }
+  - title: "📚 Docs"
+    exclusive: true
+    when:
+      conventional: { types: [docs, doc] }
+  - title: "Other"
+    exclusive: true
+  - type: version-resolver
+    semver-increment: patch
+
+change-template: "- $TITLE (#$NUMBER) @$AUTHOR"
+change-title-escapes: '\<*_&'
+no-changes-template: "- no changes"
+
+template: |
+  ## Changes
+
+  $CHANGES
+
+  ## Images
+
+  ```
+  ghcr.io/blackhorseya/x-monorepo/rpc:$RESOLVED_VERSION
+  ghcr.io/blackhorseya/x-monorepo/catalog-rpc:$RESOLVED_VERSION
+  ghcr.io/blackhorseya/x-monorepo/payment-rpc:$RESOLVED_VERSION
+  ghcr.io/blackhorseya/x-monorepo/payment-worker:$RESOLVED_VERSION
+  ghcr.io/blackhorseya/x-monorepo/worker:$RESOLVED_VERSION
+  ghcr.io/blackhorseya/x-monorepo/migrate:$RESOLVED_VERSION
+  ghcr.io/blackhorseya/x-monorepo/console:$RESOLVED_VERSION
+  ```
+
+  ## Verify
+
+  Images carry an SBOM + provenance attestation and a keyless cosign signature; `checksums.txt` is signed too, and every archive has a GitHub artifact attestation.
+
+  ```bash
+  ID='https://github.com/blackhorseya/x-monorepo/.github/workflows/release.yml@refs/heads/main'
+  ISS=https://token.actions.githubusercontent.com
+  cosign verify --certificate-identity "$ID" --certificate-oidc-issuer "$ISS" ghcr.io/blackhorseya/x-monorepo/rpc:$RESOLVED_VERSION
+  cosign verify-blob --certificate-identity "$ID" --certificate-oidc-issuer "$ISS" --bundle checksums.txt.sigstore.json checksums.txt
+  gh attestation verify x-monorepo_${RESOLVED_VERSION}_linux_amd64.tar.gz --repo blackhorseya/x-monorepo
+  ```
+
+  Or all of it at once: `scripts/release-verify.sh v$RESOLVED_VERSION` (the release run's `verify` job did the same right after publishing).
+
+  **Full changelog**: https://github.com/blackhorseya/x-monorepo/compare/$PREVIOUS_TAG...v$RESOLVED_VERSION
+
+# PR labels (labeler.yml): one from the Conventional Commits type, plus one per area touched.
+# Dependabot labels its own PRs (dependencies / go / github_actions), so build(deps) is not here.
+autolabeler:
+  - label: breaking
+    title: ['/^\w+(\(.+\))?!:/']
+  - label: feature
+    title: ['/^feat(\(.+\))?!?:/']
+  - label: fix
+    title: ['/^fix(\(.+\))?!?:/']
+  - label: refactor
+    title: ['/^(refactor|perf)(\(.+\))?!?:/']
+  - label: test
+    title: ['/^test(\(.+\))?!?:/']
+  - label: documentation
+    title: ['/^docs?(\(.+\))?!?:/']
+  - label: ci
+    title: ['/^(ci|chore|build)(?!\(deps\))(\(.+\))?!?:/']
+  - label: proto
+    files: ['protos/**']
+  - label: web
+    files: ['web/**']
+  - label: helm
+    files: ['deployments/**']
+  - label: ordering
+    files: ['pkgs/ordering/**']
+  - label: inventory
+    files: ['pkgs/inventory/**']
+  - label: platform
+    files: ['pkgs/platform/**', 'pkgs/kernel/**']

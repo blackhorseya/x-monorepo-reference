@@ -1,0 +1,15 @@
+# Profile 5: the console on, with its own host; everything else default + a database.
+secrets:
+  postgresUrl: postgres://app:app@postgres:5432/app?sslmode=disable
+  catalogRpc: { apiKey: "catalog-rpc-key-0123456789ab" }
+console:
+  enabled: true
+  replicaCount: 2
+  ingress:
+    enabled: true
+    className: nginx
+    hosts: [{ host: console.example.com, paths: [{ path: /, pathType: Prefix }] }]
+    tls: [{ secretName: console-tls, hosts: [console.example.com] }]
+config:
+  ordering: { require_payment: false }
+paymentRpc: { enabled: false }

@@ -1,0 +1,593 @@
+# Default values for x-monorepo. Everything the binaries read comes from two places:
+#   - the ConfigMap rendered from `config` below, mounted at /etc/x-monorepo/config.yaml
+#     and pointed at with APP_CONFIG (same keys as configs/config.example.yaml);
+#   - APP_* env vars for secrets (postgres / redis URL, API keys, JWT secret) and for the
+#     values this chart derives (http.shutdown_*). env beats file beats built-in defaults.
+# Images are the goreleaser ones: ghcr.io/blackhorseya/x-monorepo/{rpc,catalog-rpc,payment-rpc,payment-worker,worker,migrate}:<tag>.
+# They are distroless (no shell): no exec probes, no preStop sleep — the apps' own graceful
+# shutdown does that job (see rpc.shutdown / worker.terminationGracePeriodSeconds).
+# The optional console (web/apps/console/Dockerfile, nginx) is .../console:<tag>.
+
+image:
+  registry: ghcr.io/blackhorseya/x-monorepo
+  # Empty = .Chart.appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# The ghcr packages are public: no pull secret needed. For a private mirror:
+#   kubectl create secret docker-registry ghcr --docker-server=ghcr.io --docker-username=<user> --docker-password=<PAT with read:packages>
+imagePullSecrets: []
+#  - name: ghcr
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532   # distroless nonroot
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile: { type: RuntimeDefault }
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities: { drop: [ALL] }
+
+# Rendered verbatim as config.yaml (APP_CONFIG). Keys / meaning: configs/config.example.yaml
+# and the README "Config" table. Do NOT put http.shutdown_delay / http.shutdown_timeout here:
+# the chart sets them from rpc.shutdown so terminationGracePeriodSeconds cannot drift from them.
+# Secrets (postgres.url, redis.url, auth.api_keys, auth.jwt.hs256_secret) go in `secrets`.
+config:
+  # ordering.require_payment (docs/payment.md §8): an order that becomes CONFIRMED while this is true takes
+  # payment_required = true (a snapshot, never changed) and is completed only through payment. ON by default since
+  # chart 0.3.53 (#367 slice 6), together with paymentRpc.enabled below. It needs payment-rpc (paymentRpc.enabled) and
+  # auth (config.auth.mode optional or required: with auth off nobody can pay), and the only provider is the mock,
+  # which nobody can really pay: orders that need payment are cancelled after paymentRpc.config.window unless
+  # someone pays them through the mock control (paymentRpc.config.mock_control, kind and tests only).
+  # TO TURN PAYMENT OFF ON PURPOSE set BOTH: config.ordering.require_payment=false and paymentRpc.enabled=false.
+  # Upgrading a release that never wrote this key: WRITE IT (true or false) before you upgrade — the chart cannot tell
+  # an unset value from the default, so an upgrade that renders turns the switch on (docs/operations.md, "Upgrade notes").
+  ordering: { require_payment: true }
+  http:
+    addr: ":8080"       # the Service / probes below assume this port
+    docs: false
+    timeout: 10s
+    rate_limit: { rps: 0, burst: 0, by: global }
+  auth:
+    # off | optional | required — quoted: unquoted `off` is a YAML 1.1 boolean and would render
+    # as `mode: false`. With `optional` / `required`, API keys the identity service stores in
+    # the DB (the first one comes from `worker bootstrap`, docs/operations.md) are checked too,
+    # so secrets.apiKeys / secrets.jwtHs256Secret / config.auth.jwt.public_key may stay empty;
+    # with `required`, protected RPCs still need a valid DB/static API key or JWT; `auth.public`
+    # procedures and HTTP probes (health, readiness) remain accessible without one.
+    mode: "off"
+    admin_role: admin
+    jwt: { issuer: "", audience: "", public_key: "" }
+    # External OIDC login (docs/identity-login.md). The chart ships no IdP: point `issuers` at yours
+    # (Keycloak, Auth0, Entra, Dex ...). Off = nothing below is read, behaviour unchanged. On =
+    # at least one issuer, each with `issuer` (https, must equal the token's iss exactly) and
+    # `audience` (our client id); `mapping` bound (default, fail-closed) | auto_provision. An http
+    # issuer is accepted only on a loopback host or with `allow_insecure_issuer: true` (dev
+    # only; deployments/helm/kind/values.yaml). When auth.jwt above is also set, its `issuer`
+    # must be pinned and differ from every issuer here, or the pods refuse to start.
+    # Lists are not env-overridable: keep issuers here, flip APP_AUTH_OIDC_ENABLED if needed.
+    oidc:
+      enabled: false
+      issuers: []
+      # - issuer: https://idp.example.com/realms/shop
+      #   audience: x-console
+      #   mapping: bound
+    public: []
+    resolver_timeout: 2s
+    last_used_interval: 1m
+  # postgres.url comes from `secrets`. Pool limits are per pod: total connections =
+  # (rpc + worker + CronJob pods) x max_open_conns, below Postgres max_connections
+  # (docs/operations.md). The worker needs >= 2 x subscribers + 1 (15: 7 subscribers); to give it less than
+  # rpc, set APP_POSTGRES_MAX_OPEN_CONNS in worker.extraEnv.
+  # Where rpc finds the catalog is the chart's (APP_CATALOG_UPSTREAM, the catalog-rpc Service of this release)
+  # and the key it presents is secrets.catalogRpc.*; only the budget of one call is tunable here.
+  catalog:
+    timeout: 3s
+  postgres:
+    max_open_conns: 25
+    max_idle_conns: 10
+    conn_max_lifetime: 30m
+    conn_max_idle_time: 5m
+  log:
+    level: info
+    format: json
+  otel:
+    # OTLP/gRPC collector. Empty = telemetry off: the worker has no HTTP server, so without this
+    # it exports NOTHING — no consumer lag, no outbox / inbox gauges, so none of the eventbus
+    # alerts can fire. rpc still serves /api/metrics for a Prometheus scrape.
+    endpoint: ""
+    insecure: true
+  worker:
+    consumer_group: worker   # replicas share it (split the work); a new name replays from start_from
+    broker: postgres         # redis needs secrets.redisUrl
+    start_from: beginning
+    handler_timeout: 10s     # must fit inside the 8s drain + terminationGracePeriodSeconds below
+    poll_interval: 200ms     # outbox poll when idle: lower = lower latency, more DB queries (docs/operations.md)
+
+secrets:
+  # Name of a Secret you manage, with any of the keys APP_POSTGRES_URL, APP_REDIS_URL,
+  # APP_AUTH_API_KEYS, APP_AUTH_JWT_HS256_SECRET. When set, the values below are ignored and
+  # the chart creates no Secret (the migrate hook reads this one directly).
+  existingSecret: ""
+  # Otherwise these are put into <release>-env. Empty = key not rendered (the app then uses
+  # config.yaml / its default — an empty postgresUrl means in-memory repositories).
+  postgresUrl: ""
+  redisUrl: ""
+  apiKeys: ""          # "name=key[:role|role],name=key"
+  jwtHs256Secret: ""
+  # catalog-rpc reads NONE of the above: it refuses to start with auth.jwt / auth.oidc, and these
+  # carry rpc's JWT secret and user api keys. It gets its own Secret (<release>-catalog-rpc-env):
+  # APP_POSTGRES_URL from postgresUrl above, and APP_AUTH_API_KEYS "rpc=<apiKey>:<config.auth.admin_role>".
+  # secrets.existingSecret is the release-wide Secret and is NOT a source for catalog-rpc.
+  catalogRpc:
+    # The one service key rpc presents (catalog-rpc --require-durable accepts exactly one key, named rpc,
+    # so it is always rpc=<this>:<admin role>; with your own Secret, APP_AUTH_API_KEYS must be that single entry).
+    # Without it (and without existingSecret) the chart refuses to render catalogRpc.enabled.
+    # No ',' ':' '=' or whitespace.
+    apiKey: ""
+    # Or a Secret you manage, with the keys APP_POSTGRES_URL and APP_AUTH_API_KEYS
+    # ("rpc=<key>:<admin role>"). Mutually exclusive with apiKey, and not the release-wide
+    # secrets.existingSecret. Both keys are read by secretKeyRef (optional: false): a Secret that
+    # lacks one keeps the pod from starting (CreateContainerConfigError), it does not fall back to memory.
+    existingSecret: ""
+  # payment-rpc (paymentRpc.enabled) reads NONE of the release-wide keys either: it refuses to start with
+  # auth.jwt / auth.oidc and must not see rpc's JWT secret or user api keys. It gets its own Secret
+  # (<release>-payment-rpc-env): APP_POSTGRES_URL from postgresUrl above, APP_AUTH_API_KEYS
+  # "rpc=<apiKey>:<config.auth.admin_role>" (serve only), APP_PAYMENT_MOCK_WEBHOOK_SECRET (serve, consume,
+  # expire: the provider's credential, never the worker's) and APP_PAYMENT_API_KEY (rpc's copy of the SAME
+  # service key, read by rpc alone, by secretKeyRef). secrets.existingSecret is NOT a source for it.
+  paymentRpc:
+    # The one service key rpc presents (payment-rpc --require-durable accepts exactly one key, named rpc).
+    # No ',' ':' '=' or whitespace.
+    apiKey: ""
+    # The mock provider's webhook signing secret. Required: empty would give every process its own random
+    # one, and serve could not verify what another process signed. No whitespace.
+    mockWebhookSecret: ""
+    # Or a Secret you manage, with the keys APP_POSTGRES_URL, APP_AUTH_API_KEYS ("rpc=<key>:<admin role>"),
+    # APP_PAYMENT_API_KEY (the same <key>) and APP_PAYMENT_MOCK_WEBHOOK_SECRET. Mutually exclusive with
+    # apiKey / mockWebhookSecret, and neither the release-wide secrets.existingSecret nor catalog-rpc's.
+    # Every key is read by secretKeyRef (optional: false): a Secret that lacks one keeps the pod from starting.
+    existingSecret: ""
+
+rpc:
+  replicaCount: 2
+  # The Deployment gives up on a rollout that makes no progress for this long. The best-effort wait for the
+  # catalog below must end before it (the chart refuses otherwise).
+  progressDeadlineSeconds: 600
+  # An initContainer on the rpc image (`rpc --wait-catalog=<n>s`): waits up to timeoutSeconds for catalog-rpc's
+  # /api/readyz so that on a rollout the catalog is normally up before this rpc takes traffic. BEST EFFORT, not a
+  # hard dependency: when the catalog does not come in time the binary logs a WARN and exits 0, the rpc starts, its
+  # own readyz does not depend on the catalog, and CreateOrder / SetStock answer UNAVAILABLE (catalog.unavailable)
+  # until it is back. It only orders a normal upgrade; on an upgrade it can see an OLD catalog-rpc pod as ready
+  # (the contract is unchanged, so a version in between is fine). enabled: false skips the wait.
+  waitForCatalog:
+    enabled: true
+    timeoutSeconds: 60
+    resources:
+      requests: { cpu: 10m, memory: 16Mi }
+      limits: { memory: 64Mi }
+  # Graceful shutdown, in seconds (the app takes Go durations; the chart renders "<n>s").
+  # After SIGTERM the pod answers /api/readyz with 503 for delaySeconds while still serving,
+  # so endpoints drop it before the listener closes; in-flight requests then get timeoutSeconds.
+  # terminationGracePeriodSeconds = delaySeconds + timeoutSeconds + graceMarginSeconds, and
+  # readiness.periodSeconds must be <= delaySeconds (the chart refuses to render otherwise).
+  # (What actually pulls a terminating pod out of Endpoints is the deletion, not the probe;
+  # the delay covers kube-proxy / ingress propagation. The bound keeps the two in step.)
+  shutdown:
+    delaySeconds: 5
+    timeoutSeconds: 15
+    graceMarginSeconds: 5
+  liveness:    # /api/healthz: process alive, dependencies not consulted
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:   # /api/readyz: Postgres ping; 503 while draining
+    initialDelaySeconds: 3
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+    successThreshold: 1
+  resources:
+    requests: { cpu: 100m, memory: 64Mi }
+    limits: { memory: 256Mi }
+  service:
+    type: ClusterIP
+    port: 80
+    annotations: {}
+  # Connect / gRPC-Web work over HTTP/1.1; native gRPC needs an h2c-capable ingress
+  # (e.g. nginx: nginx.ingress.kubernetes.io/backend-protocol: GRPC on a separate host).
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    hosts:
+      - host: api.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []
+  autoscaling:
+    enabled: false   # when on, replicaCount is ignored; needs resources.requests.cpu
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: true    # rendered only when more than one replica can exist
+    maxUnavailable: 1
+  # Prometheus Operator: a ServiceMonitor on the rpc Service's http port, path /api/metrics
+  # (always served, outside the auth chain). The operator selects ServiceMonitors by label:
+  # put what its serviceMonitorSelector wants in labels (kube-prometheus-stack: release: <name>).
+  # Without the operator, scrape the Service yourself; without any Prometheus the worker still
+  # needs config.otel.endpoint — this only covers the rpc.
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}
+    relabelings: []
+    metricRelabelings: []
+  extraEnv: []
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+
+# catalog-rpc (apps/catalog-rpc): the catalog bounded context as its own Deployment (#320). rpc has no
+# in-process catalog any more: it asks this service for every price and every SKU check, and does not start
+# without it, so it is on and `catalogRpc.enabled: false` does not render. It needs a Postgres URL and
+# secrets.catalogRpc.apiKey or existingSecret, else the chart does not render: without a URL the binary
+# would serve from memory. It runs with auth.mode required and ONLY the static key rpc=...:<admin
+# role>; its own ConfigMap and Secret carry no auth.jwt / auth.oidc. Same probes and shutdown contract
+# as rpc; /api/readyz probes Postgres. Schema: `migrate up` (the hook above), never this pod.
+# In-cluster address for the forwarding slice: <release>-catalog-rpc:<service.port>.
+catalogRpc:
+  enabled: true
+  replicaCount: 2
+  shutdown:
+    delaySeconds: 5
+    timeoutSeconds: 15
+    graceMarginSeconds: 5
+  liveness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    initialDelaySeconds: 3
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+    successThreshold: 1
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { memory: 256Mi }
+  service:
+    type: ClusterIP
+    port: 80
+    annotations: {}
+  podDisruptionBudget:
+    enabled: true    # rendered only when more than one replica
+    maxUnavailable: 1
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}
+    relabelings: []
+    metricRelabelings: []
+  # Refused at render time when it names APP_AUTH_*, APP_POSTGRES_URL or APP_CONFIG (any case):
+  # those make catalog-rpc safe and are the chart's to set.
+  extraEnv: []
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+
+# payment-rpc (apps/payment-rpc, docs/payment.md): one image, three workloads — `serve` (the internal Connect
+# PaymentService for rpc + the provider's webhook route), `consume` (the event handlers) and `expire` (the
+# sweep, a CronJob). ON by default since chart 0.3.53 (#367 slice 6), with config.ordering.require_payment: a first
+# install must give auth and the two payment secrets, or turn payment off ON PURPOSE with both values (the chart
+# refuses otherwise and says so). Off, the release renders without a single payment object, rpc is told nothing about
+# payment and ordering.require_payment cannot be on.
+# It runs on its own ConfigMap and Secret (see secrets.paymentRpc): auth.mode required with ONE static key,
+# no auth.jwt / auth.oidc, the Postgres broker (consume reads the outbox tables; a Redis broker is refused).
+# Every workload runs `--require-durable` as a container arg: no in-memory payments, and for serve no auth
+# but required with exactly the key rpc. Schema: `migrate up` (the hook above), never these pods.
+paymentRpc:
+  enabled: true
+  # payment.* of payment-rpc's own ConfigMap (docs/config.md). They must agree the way the binary checks at
+  # start: window <= mock_checkout_ttl < reconcile_window, webhook_retention 0 or > mock_redelivery_window;
+  # the chart refuses a combination the binary would refuse. The provider is "mock" (the first version's
+  # only one: a gateway nobody can really pay; its state lives in payment.mock_* and is shared by the three).
+  config:
+    window: 30m
+    reconcile_window: 24h
+    webhook_retention: 720h
+    expire_batch: 100
+    mock_checkout_ttl: 30m
+    mock_redelivery_window: 72h
+    # true = payment-rpc has the mock control entry (`/app mock pay|notify|fail`, docs/operations.md) and its mock reads the
+    # faults that entry sets. For kind and tests ONLY (kind/payment-flow-values.yaml): whoever can exec into a payment-rpc
+    # pod can then mark an order's checkout paid. Off everywhere else; there is no HTTP route either way.
+    mock_control: false
+  serve:
+    replicaCount: 2
+    shutdown:        # same contract as rpc / catalog-rpc
+      delaySeconds: 5
+      timeoutSeconds: 15
+      graceMarginSeconds: 5
+    liveness:
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 2
+      failureThreshold: 3
+    readiness:
+      initialDelaySeconds: 3
+      periodSeconds: 5
+      timeoutSeconds: 2
+      failureThreshold: 3
+      successThreshold: 1
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { memory: 256Mi }
+    # ClusterIP only (the chart refuses anything else): this port carries the internal RPC as well as the
+    # webhook, and the RPC is for rpc alone.
+    service:
+      type: ClusterIP
+      port: 80
+      annotations: {}
+    podDisruptionBudget:
+      enabled: true    # rendered only when more than one replica
+      maxUnavailable: 1
+    serviceMonitor:
+      enabled: false
+      interval: 30s
+      scrapeTimeout: 10s
+      labels: {}
+      relabelings: []
+      metricRelabelings: []
+    # Refused at render time when it names APP_AUTH_*, APP_PAYMENT_*, APP_WORKER_*, APP_REDIS_*,
+    # APP_POSTGRES_URL or APP_CONFIG (any case): those make payment-rpc safe and are the chart's to set.
+    extraEnv: []
+    podAnnotations: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    topologySpreadConstraints: []
+  # `consume` reads the Postgres outbox only. Replicas of one consumer group split the work, but adding
+  # replicas was NOT measured to make a Postgres-broker consumer faster (docs/operations.md, "Worker 輪詢間隔"),
+  # so there is no autoscaling here and the default is one replica: raise replicaCount for availability
+  # (a restart does not wait for a probe), not for throughput. Its consumer group is `payment-rpc` (so
+  # `payment-rpc.payment`, the group `payment-rpc consume` read under before #410 slice 2: the binary is payment-worker now,
+  # the ConfigMap and so the cursor are the same), deliberately outside the worker's `worker.*`: worker.autoscaling's lag query
+  # would otherwise scale the WORKER on payment's backlog.
+  consume:
+    replicaCount: 1
+    # 8s handler drain + 10s router close, must stay above 18s
+    terminationGracePeriodSeconds: 30
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { memory: 256Mi }
+    extraEnv: []
+    podAnnotations: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+  # `expire` is one run of the sweep per CronJob run. The schedule is `*/<intervalMinutes> * * * *` and
+  # payment.expire_interval is `<intervalMinutes>m`, both from this one value, so the cron period and the
+  # number the sweep reasons with ("is this reconcile query the payment's last?") cannot drift apart.
+  # Must divide 60. A CronJob is a short-lived process: its gauges (payment_reconcile_*) reach Prometheus
+  # only if config.otel.endpoint is set (an unset endpoint means no measurement, not "no backlog").
+  expire:
+    intervalMinutes: 15
+    concurrencyPolicy: Forbid
+    successfulJobsHistoryLimit: 3
+    failedJobsHistoryLimit: 3
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { memory: 128Mi }
+    extraEnv: []
+    podAnnotations: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+  # The provider's webhook, and only that, to the outside (docs/payment.md §1, §7): ONE Ingress rule per
+  # host with the single path POST /api/payment/webhook (Exact). The Connect RPC, /api/metrics, probes and
+  # docs are not routed. The route has no API key and no http.rate_limit (the signature is its credential),
+  # so the limits are the ingress's: rendered as ingress-nginx annotations (limit-rps, burst multiplier,
+  # limit-connections) plus a 1 MiB body cap. The chart refuses an enabled ingress without a class, a host,
+  # or a positive limit, and refuses `annotations` that touch the limits, the path or add snippets.
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    hosts: []
+    #  - host: pay.example.com
+    tls: []
+    rateLimit:
+      rps: 5               # requests per second per client IP
+      burstMultiplier: 3   # burst = rps x this
+      connections: 10      # concurrent connections per client IP
+
+worker:
+  replicaCount: 1
+  # No HTTP server → no probes; the process exits non-zero when it cannot start (bad config,
+  # DB / Redis unreachable) and the Deployment restarts it. Health is observed through the
+  # eventbus_* gauges over OTLP (config.otel.endpoint) and the provisioned alert rules.
+  # SIGTERM: the router stops taking messages, running handlers get up to 8s to finish and
+  # ack, the router closes within 10s. Must stay above 18s; 30s leaves room for a slow ack.
+  terminationGracePeriodSeconds: 30
+  # Replicas share config.worker.consumer_group, so adding one splits the work. What to scale
+  # on: handlers are DB-bound, so CPU stays low while the backlog grows — `lag` (KEDA
+  # ScaledObject on eventbus_consumer_lag from Prometheus; needs the KEDA operator and the
+  # worker exporting over OTLP) is the signal that means something; `cpu` is a plain HPA for
+  # clusters without KEDA. Either way replicaCount is ignored when enabled.
+  autoscaling:
+    enabled: false
+    metric: lag            # lag | cpu
+    minReplicas: 1
+    maxReplicas: 6
+    cpu:
+      targetUtilizationPercentage: 70
+    lag:
+      # Prometheus the OTLP collector writes to. The KEDA operator queries it from ITS OWN
+      # namespace, so a bare Service name does not resolve: use <svc>.<namespace>.svc (the
+      # chart refuses an address whose host has no dot).
+      prometheusAddress: http://prometheus.monitoring.svc:9090
+      # Unacked messages per replica to aim for; scale out above it. The worst group counts
+      # (max over topics / groups: the gauges are per replica, never sum them).
+      threshold: 100
+      # Query override; empty = max over every consumer group of this consumer_group prefix.
+      query: ""
+      # Only meaningful with minReplicas 0, which lag scaling cannot use (the gauge comes
+      # from the worker itself: at 0 replicas nothing reports lag), so these do not affect
+      # scaling here; KEDA still uses pollingInterval to refresh the ScaledObject status.
+      # Scale-out / scale-in pace is the HPA's: see behavior below.
+      pollingInterval: 30
+      cooldownPeriod: 300
+    # autoscaling/v2 HPA behavior, passed through to the HPA (cpu) or to the HPA KEDA creates
+    # (lag). The HPA's own scale-down stabilization is 300s by default: after the backlog is
+    # gone the worker stays scaled out for that long. Empty = Kubernetes defaults.
+    behavior: {}
+    #  scaleDown: { stabilizationWindowSeconds: 60 }
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { memory: 256Mi }
+  extraEnv: []
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# The web console (web/apps/console): nginx serving the Vite build, /api proxied to this
+# release's rpc Service in-cluster (RPC_UPSTREAM; the browser stays same-origin, no CORS).
+# Off by default: it is a UI for operators. The image exists from v0.23.0 on (the default
+# appVersion); an older image.tag has no console. It gets no config file and no Secret — with
+# auth.mode on, people paste their own API key / JWT into the console's credential dialog.
+console:
+  enabled: false
+  replicaCount: 1
+  liveness:    # /healthz is nginx itself; the rpc's health is the rpc's probes' business
+    initialDelaySeconds: 2
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    initialDelaySeconds: 1
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+    successThreshold: 1
+  resources:
+    requests: { cpu: 10m, memory: 16Mi }
+    limits: { memory: 64Mi }
+  service:
+    type: ClusterIP
+    port: 80
+    annotations: {}
+  # Plain HTTP/1.1: the console only ever uses Connect over JSON.
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    hosts:
+      - host: console.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []
+  extraEnv: []
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# Ingress-only NetworkPolicies, one per Deployment (egress untouched — where Postgres / Redis /
+# the collector live is the cluster's business). Needs a CNI that enforces NetworkPolicy (kind's
+# kindnet does not, so helm-kind cannot prove them). rpc always admits the console's pods;
+# each ingressFrom is a list of NetworkPolicyPeer (podSelector / namespaceSelector / ipBlock),
+# and an EMPTY list means any source on the port — list your ingress controller's namespace
+# and Prometheus to tighten it. worker gets no ingress at all.
+networkPolicy:
+  enabled: false
+  rpc:
+    ingressFrom: []
+    #  - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: ingress-nginx } }
+    #  - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: monitoring } }
+  console:
+    ingressFrom: []
+  # catalog-rpc admits the rpc pods of this release (when catalogRpc.enabled); ingressFrom is ON TOP
+  # of that, e.g. Prometheus's namespace for the ServiceMonitor. Never empty = any source.
+  catalogRpc:
+    ingressFrom: []
+  # payment-rpc serve admits the rpc pods of this release (when paymentRpc.enabled); ingressFrom is ON TOP
+  # of that: list your ingress controller's namespace (the provider's webhook arrives through it) and
+  # Prometheus's. Never empty = any source. consume and expire have no listener: no ingress at all.
+  paymentRpc:
+    ingressFrom: []
+
+# `migrate up` as a pre-install / pre-upgrade hook: new code never starts against an old
+# schema. The Job needs the Postgres URL before the release's own Secret exists, so with
+# secrets.postgresUrl the chart renders a hook-scoped copy (<release>-migrate-env); with
+# secrets.existingSecret it reads that. Not rendered when neither gives a URL.
+migrate:
+  enabled: true
+  backoffLimit: 2
+  activeDeadlineSeconds: 600
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { memory: 128Mi }
+
+# `worker prune --older-than <olderThan>`: deletes outbox rows every consumer group has acked
+# and inbox rows older than this. The "Eventbus retention overdue" alert
+# (deployments/docker/grafana/provisioning/alerting.yaml) fires at 45d = 1.5 × 720h: move both
+# together. Rows a group has not acked are never deleted; the alert "rows held by a stale
+# consumer group" tells you which group, forgetGroups removes its cursor. The same thing
+# ad hoc, without kubectl: AdminService.Prune (console Prune page) — dry run, forget, small runs.
+prune:
+  enabled: true
+  schedule: "17 3 * * *"
+  olderThan: 720h
+  dryRun: false
+  unconsumed: false
+  forgetGroups: []
+  batch: 10000
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { memory: 128Mi }
+
+# `worker expire --older-than <olderThan>`: the reservation TTL. A RESERVED reservation held
+# longer than this gives its stock back and ordering is asked to cancel the order (the customer
+# neither completed nor cancelled it). The "Reservation expiry overdue" alert
+# (deployments/docker/grafana/provisioning/alerting.yaml) fires at 36h = 1.5 × 24h: move both
+# together. Only RESERVED is touched — COMMITTED / RELEASED are never due. The same thing ad hoc,
+# without kubectl: InventoryService.ExpireReservations (console Expire page) — dry run, small runs.
+expire:
+  enabled: true
+  schedule: "*/15 * * * *"
+  olderThan: 24h
+  dryRun: false
+  batch: 100
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { memory: 128Mi }

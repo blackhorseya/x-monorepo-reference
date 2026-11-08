@@ -1,0 +1,137 @@
+# Template for configs/local.yaml (gitignored). `task run` / `task migrate` copy it there on
+# first use and load it via APP_CONFIG; edit local.yaml freely, or pass CONFIG=<file>.
+# Every key can also be set as APP_<SECTION>_<KEY>; env beats file beats the built-in defaults.
+# Values below are the local-dev profile — production should run on env vars.
+
+http:
+  addr: ":8080"
+  # mounts /api/docs and /api/openapi/<bc>.yaml — keep false in production
+  docs: true
+  # after SIGTERM: keep serving with /api/readyz = 503 for this long so the load
+  # balancer stops routing first (0 = close at once; behind Kubernetes use at
+  # least one readiness probe period), then give in-flight requests shutdown_timeout.
+  shutdown_delay: 0s
+  shutdown_timeout: 15s
+  # server-side deadline of one RPC: the use case's context expires, the client gets
+  # DEADLINE_EXCEEDED (x-error-code request.timeout). 0 = none.
+  timeout: 10s
+  # token bucket on RPCs, outside auth: rps 0 = off; burst 0 = rps; by: global | peer (client IP)
+  rate_limit:
+    rps: 0
+    burst: 0
+    by: global
+
+auth:
+  # off: every call is anonymous (local dev, E2E). optional: a credential is verified when sent.
+  # required: no valid credential → UNAUTHENTICATED (x-error-code auth.unauthenticated / auth.invalid_credential).
+  # Probes, /api/metrics and /api/docs are outside the RPC chain and always open.
+  mode: off
+  # Static keys for X-API-Key, "name=key[:role|role],name=key" (≥16 chars each); the principal's
+  # subject is the name, roles the list after the colon (admin.v1.AdminService needs admin_role).
+  api_keys: ""
+  admin_role: admin
+  jwt:
+    # Authorization: Bearer <token>. Exactly one of hs256_secret (≥32 bytes) or public_key (PEM:
+    # RSA / EC / Ed25519, algorithm family pinned to the key type). exp is required; iss / aud are
+    # checked when set. Claims → principal: sub, name, roles.
+    issuer: ""
+    audience: ""
+    hs256_secret: ""
+    public_key: ""
+  # External OIDC token verifier (docs/identity-login.md). Off: nothing below is read. When on, every
+  # issuer needs its audience (our client id); http issuers pass only on a loopback host or with
+  # allow_insecure_issuer (dev only). auth.jwt above, if also set, must pin its own issuer.
+  oidc:
+    enabled: false
+    issuers: []
+    #  - issuer: http://dex.localtest.me:5556/dex
+    #    audience: x-console
+    #    mapping: bound              # bound (default) | auto_provision
+    #    allow_insecure_issuer: true # dev Dex only
+  # Procedures that never need a credential: ["/ordering.v1.OrderService/GetOrder"]
+  public: []
+  # Bound on one identity-BC key lookup (X-API-Key the config does not know; auth runs outside
+  # http.timeout). A stuck database rejects fast instead of holding every request. 0 = unbounded.
+  resolver_timeout: 2s
+  # How often an identity API key's last_used_at is written (Console "Last used", ListApiKeys
+  # last_use_time): at most once per key per interval, off the request path, best-effort (a failed
+  # write never fails the request). It caps the write rate, not the staleness: with several replicas the column can trail by nearly two intervals. 0 = never record.
+  last_used_interval: 1m
+
+log:
+  level: debug  # debug | info | warn | error
+  format: text  # json | text
+
+postgres:
+  # Matches `task compose-up` (deployments/docker/docker-compose.yaml); apps ping it at startup.
+  # Empty = no database: repositories fall back to in-memory; `task migrate -- up` needs it set.
+  url: postgres://app:app@127.0.0.1:5432/app?sslmode=disable
+  # Optional host:port every connection attempt must dial (host= overrides and fallback hosts
+  # included); NewDB refuses to connect otherwise. Empty = no check. Target only, not TLS.
+  expect_target: ""
+  # Per-process pool (rpc, worker and the CLIs each open their own): total connections is
+  # replicas x max_open_conns and must stay below the server's max_connections
+  # (docs/operations.md). 0 = unlimited open. The worker refuses a cap below
+  # 2 x subscribers + 1 (11 today): every subscriber holds one connection while its handler
+  # uses another.
+  max_open_conns: 25
+  max_idle_conns: 10        # 0 = database/sql default (2); must not exceed max_open_conns when capped
+  conn_max_lifetime: 30m    # recycle: a pool should not pin itself to one backend forever
+  conn_max_idle_time: 5m    # a burst's extra connections go back to the server
+
+redis:
+  # Only used (connected, pinged) when worker.broker is redis; `task compose-up` runs one here.
+  url: redis://127.0.0.1:6379/0
+
+otel:
+  # OTLP/gRPC endpoint — `task compose-up` runs grafana/otel-lgtm here (Grafana :3000).
+  # Empty = telemetry off (no-op providers). Prometheus metrics are bridged in, so
+  # /api/metrics and Grafana show the same series.
+  endpoint: 127.0.0.1:4317
+  insecure: true
+  service_name: ""   # empty = executable name (rpc)
+
+# The catalog is its own service (apps/catalog-rpc, `task catalog-rpc`, which reads its own configs/catalog-rpc.yaml): rpc asks it over Connect and does
+# not start without upstream and the service key. Only apps/rpc reads this section. The key is a secret:
+# APP_CATALOG_API_KEY (`task run` sets the local dev one), never this file. See docs/config.md.
+catalog:
+  upstream: http://127.0.0.1:8081
+  timeout: 3s        # one call to the catalog; a slower one is UNAVAILABLE (catalog.unavailable)
+
+# Payment is optional for rpc until payment-rpc is deployed (docs/payment.md §6): with nothing set,
+# payment.v1.PublicPaymentService answers payment.unavailable and everything else is unchanged. To try it
+# locally (task payment-rpc listens on :8082), uncomment this and set APP_PAYMENT_API_KEY to the key named
+# rpc in payment-rpc's auth.api_keys (a secret: env only, never this file). Half of it, or
+# ordering.require_payment: true without it, makes rpc refuse to start.
+# payment:
+#   upstream: http://127.0.0.1:8082
+#   timeout: 3s      # one call to payment-rpc; a slower one is UNAVAILABLE (payment.unavailable)
+
+ordering:
+  # Read by apps/worker (an order becomes CONFIRMED in its StockReserved consumer) and by apps/rpc (the
+  # payment API answers payment.disabled while this is off; on, it needs the payment section below). The value at
+  # that moment is stored on the order as payment_required and never changes; CompleteOrder reads that
+  # snapshot, so a CONFIRMED order with payment_required: true answers order.payment_required.
+  # Leave false until Payment ships (docs/payment.md): nothing can pay an order yet.
+  require_payment: false
+
+worker:
+  # apps/worker: consumer group of this process (offset cursor per topic).
+  consumer_group: worker
+  # postgres: handlers read the outbox tables directly (nothing else to run).
+  # redis:    the worker forwards each outbox table into a Redis Stream and reads that
+  #           (needs redis.url). The outbox stays the write path either way.
+  broker: postgres
+  # Where a consumer group that has NO cursor yet begins: beginning (replay what is
+  # retained) or latest (only what arrives after it was created). An existing cursor is
+  # never moved, so this only matters the first time a group name appears.
+  start_from: beginning
+  # deadline of one handler attempt (the consumer-side http.timeout): the use case's
+  # context expires, the attempt is retried, then the message is parked as poison
+  # with reason "handler timed out". 0 = none.
+  handler_timeout: 10s
+  # How long each Postgres subscriber waits before it asks its outbox table again after
+  # finding nothing: an event arriving during that wait is seen 0 to about one interval
+  # later (no wait after a poll that found a message), and each polling loop costs one
+  # query per replica per interval (see docs/operations.md). Must be > 0.
+  poll_interval: 200ms

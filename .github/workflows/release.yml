@@ -1,0 +1,367 @@
+name: release
+run-name: "[release] ${{ github.event.workflow_run.head_sha || github.sha }}"
+
+# Every green CI run on main becomes a release (same shape as kxcw-goapi-v2):
+#   prepare   release-drafter → draft release "vX.Y.Z" with notes from the merged PRs' titles
+#   build     goreleaser on that commit → archives onto the draft + one multi-arch image per
+#             app on ghcr, then `docker buildx build --push` of the web console (nginx image,
+#             web/apps/console/Dockerfile; goreleaser has no binary to attach it to) — all
+#             tagged vX.Y.Z before anything is published. Every image carries an SBOM and
+#             provenance attestation and a keyless cosign signature; checksums.txt is signed too,
+#             and the archives + checksums.txt get a GitHub artifact attestation (SLSA provenance,
+#             `gh attestation verify`)
+#   publish   gh release edit --draft=false → GitHub creates the tag and marks it latest
+#   verify    scripts/release-verify.sh on what was just published: the Verify block of the release
+#             notes, run for real (checksums bundle, archive attestation, seven image signatures)
+#   chart     opens a chart-only PR moving deployments/helm's appVersion to the new tag (CI and the
+#             release-gate comment on it are dispatched by hand: GITHUB_TOKEN pushes start no workflows;
+#             the release-gate dispatch queues behind the approved pull_request run, see release-gate.yml). Needs the repo
+#             setting "Allow GitHub Actions to create and approve pull requests"; without it the
+#             branch is pushed and the step summary links the compare page.
+# Nothing deploys. workflow_dispatch re-runs the whole chain for the current main HEAD.
+#
+# workflow_run has no paths-ignore, so `prepare` gates by hand: diff the commit against the last
+# published tag (scripts/releasable.sh) and skip the whole chain when nothing shipped changed. The
+# diff base is the last tag, not the parent commit — ci.yml cancels in-progress main runs, so two
+# quick merges fire release once, for the second head, and it must still see the first's changes.
+#
+# workflow_run's github.sha is default-branch HEAD, not the commit CI ran on: use
+# github.event.workflow_run.head_sha everywhere. A release published with GITHUB_TOKEN emits
+# no `push: tags` / `release` events to other workflows (recursion prevention), which is why
+# this file has no tag trigger and nothing else chains off the tag.
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+env:
+  GOTOOLCHAIN: local
+  HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+# `shell: bash` is what turns on pipefail: the runner's default (`bash -e {0}`) lets `a | b` pass when a failed (#465).
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5 # p90 9s, max 19s (last 11 days)
+    permissions:
+      contents: write        # create / update the draft release
+      pull-requests: read    # list merged PRs
+    outputs:
+      release: ${{ steps.gate.outputs.release }}
+      tag: ${{ steps.draft.outputs.tag_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          fetch-depth: 0   # tags, for the diff base
+      - id: gate
+        name: Anything to release since the last tag?
+        run: |
+          . scripts/best-effort.sh   # capture: the status of git describe next to what it printed
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "manual dispatch: releasing \`$HEAD_SHA\` unconditionally" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          capture base describe_rc git describe --tags --abbrev=0 --match 'v*' "$HEAD_SHA" 2>/dev/null || exit 1
+          if [ "$describe_rc" != 0 ]; then base=""; echo "git describe exited $describe_rc: no tag reachable from $HEAD_SHA, releasing" >&2; fi
+          if [ -z "$base" ]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "no previous tag reachable from \`$HEAD_SHA\`: releasing" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # scripts/releasable.sh owns the list of paths that change no shipped artifact;
+          # `task release-gate` runs the same script locally.
+          releasable() { scripts/releasable.sh "$base" "$HEAD_SHA"; }
+          releasable_files=$(releasable) || exit 1
+          if [ -z "$releasable_files" ]; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "## skipped: nothing releasable since $base" >> "$GITHUB_STEP_SUMMARY"
+            git diff --name-only "$base" "$HEAD_SHA" | sed 's/^/- /' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "release=true" >> "$GITHUB_OUTPUT"
+          { echo "## releasable changes since $base"; releasable | sed 's/^/- /'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: release-drafter/release-drafter@978bb0b30c5ee8cdd332ced253758157150d43f0 # v7
+        if: steps.gate.outputs.release == 'true'
+        id: draft
+        with:
+          publish: false   # labels are labeler.yml's job (autolabeler action, pull_request_target)
+          commitish: ${{ github.event.workflow_run.head_sha || github.sha }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    needs: [prepare]
+    if: needs.prepare.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20 # p90 387s, max 394s (last 11 days)
+    permissions:
+      contents: write   # upload archives to the draft
+      packages: write   # ghcr.io/blackhorseya/x-monorepo/{rpc,catalog-rpc,payment-rpc,payment-worker,worker,migrate,console}
+      id-token: write   # cosign keyless + attest-build-provenance: the OIDC token names this workflow
+      attestations: write   # store the archives' provenance attestation on the repo
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          fetch-depth: 0
+      # The tag does not exist yet (publish creates it), but goreleaser ≥ v2.18.1 refuses to run
+      # without one, so create it locally on the commit being released. Never pushed.
+      - run: git tag "${{ needs.prepare.outputs.tag }}" "$HEAD_SHA"
+      # Share the Go build cache with ci.yml's release-snapshot job (plan.sh group "cross"): same 12
+      # cross-compile targets and flags (-X only changes the link step). This run is a workflow_run, which
+      # GitHub gives read-only access to the default branch's caches: it restores what ci.yml's
+      # release-snapshot saved on its main push (weekly) and never writes. A missing entry only makes the
+      # cross-compiles cold (slower), it cannot change the result. The default scope would be this job's
+      # name, "build", i.e. the host-only `bin` group.
+      - uses: ./.github/actions/setup
+        with:
+          cache-scope: release-snapshot
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with: { package_json_file: web/package.json }
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+      - uses: ./.github/actions/pnpm-cache
+      # The console's dist/ before goreleaser: a broken web build fails the job before any Go
+      # image has been pushed under this version. VITE_CONSOLE_VERSION is what its footer shows.
+      - run: VITE_CONSOLE_VERSION="${TAG#v}" task web-build   # same spelling as goreleaser's .Version
+        env: { TAG: "${{ needs.prepare.outputs.tag }}" }
+      # dockers_v2 drives `docker buildx build --push` with --sbom and two platforms; the
+      # default docker driver can do neither, so a docker-container builder is required.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Keyless signing (.goreleaser.yaml signs / docker_signs, and the console step below):
+      # the certificate's identity is this workflow at refs/heads/main, the issuer GitHub's.
+      # no floating v4 tag exists: @v4 fails to resolve. cosign-release is pinned above the
+      # installer's default (v3.0.6): sign-blob there fails the whole release on Rekor's 409 "equivalent
+      # entry already exists" (v0.36.0 attempt 1, #195); v3.1.4's sigstore-go fetches that entry instead
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.4
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7
+        with:
+          version: "~> v2.18"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ needs.prepare.outputs.tag }}
+      # SLSA provenance for what goreleaser just uploaded — the archives and checksums.txt — stored
+      # as GitHub artifact attestations (Settings → Attestations; this repo is public, so anyone can
+      # `gh attestation verify <file> --repo blackhorseya/x-monorepo`). cosign already signs
+      # checksums.txt; this is the per-archive statement of which workflow run built it. The images'
+      # provenance comes from buildx (--sbom / dockers_v2), not from here. Exact tag on purpose:
+      # release.yml runs only on main, so a tag that does not resolve breaks a release, not a PR.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            bin/dist/*.tar.gz
+            bin/dist/checksums.txt
+      # The console image: dist/ from `task web-build` above into nginx-unprivileged. The
+      # Dockerfile only COPYs and the base image is multi-arch, so like the Go images this
+      # needs no QEMU. Same tag rule as .goreleaser.yaml's image_tags (latest unless prerelease);
+      # the `source` label is what links the ghcr package to this repo. --sbom matches what
+      # dockers_v2 attaches to the Go images (buildx adds provenance on its own); the index
+      # digest from --metadata-file is what gets signed, so one signature covers both tags.
+      - name: Push the console image
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          IMAGE: ghcr.io/blackhorseya/x-monorepo/console
+        run: |
+          version=${TAG#v}
+          tags=(-t "$IMAGE:$version")
+          case "$version" in *-*) ;; *) tags+=(-t "$IMAGE:latest") ;; esac
+          docker buildx build --platform linux/amd64,linux/arm64 --push "${tags[@]}" \
+            --sbom=true --metadata-file bin/console-metadata.json \
+            --label org.opencontainers.image.title=x-monorepo-console \
+            --label org.opencontainers.image.description="Web console of the x-monorepo template (nginx)" \
+            --label org.opencontainers.image.source=https://github.com/${{ github.repository }} \
+            --label org.opencontainers.image.revision="$HEAD_SHA" \
+            --label org.opencontainers.image.version="$version" \
+            --label org.opencontainers.image.licenses=MIT \
+            web/apps/console
+          digest=$(jq -r '."containerimage.digest"' bin/console-metadata.json) || exit $?
+          cosign sign --yes "$IMAGE@$digest"
+      - run: |
+          {
+            echo "## ${{ needs.prepare.outputs.tag }} built from \`$HEAD_SHA\`"
+            for app in rpc catalog-rpc payment-rpc payment-worker worker migrate console; do
+              echo "- \`ghcr.io/blackhorseya/x-monorepo/$app:${TAG#v}\`"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+        env: { TAG: "${{ needs.prepare.outputs.tag }}" }
+
+  publish:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5 # p90 5s (last 11 days)
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the draft (creates the tag)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: gh release edit "$TAG" --repo "$REPO" --target "$HEAD_SHA" --draft=false --latest
+
+  # Verify what the notes tell a reader to verify. Red here = published but broken signing /
+  # attestation (v0.26.0 took three tries for exactly that); the chart PR does not wait for it.
+  verify:
+    needs: [prepare, publish]
+    if: needs.prepare.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5 # p90 29s (last 11 days)
+    permissions:
+      contents: read
+      packages: read   # the packages are public; the login below only lifts ghcr's anonymous rate limit
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # same pin and cosign-release as build above and ci.yml's release-snapshot (rekor-canary.yml reads it from here)
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - run: scripts/release-verify.sh "${{ needs.prepare.outputs.tag }}" | tee -a "$GITHUB_STEP_SUMMARY"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+
+  chart:
+    needs: [prepare, publish]
+    if: needs.prepare.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5 # p90 13s (last 11 days)
+    permissions:
+      contents: write        # push the chore/chart-appversion-* branch
+      pull-requests: write   # open the PR
+      actions: write         # gh workflow run ci.yml / release-gate.yml on it
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main   # the PR targets current main, not the released commit
+      - name: PR moving the chart's appVersion to this release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          . scripts/best-effort.sh   # capture: a failed read of the PR's runs is said and the previous read is kept
+          chart=deployments/helm/x-monorepo/Chart.yaml
+          v=${TAG#v}
+          cur=$(sed -n 's/^appVersion: "\(.*\)"$/\1/p' "$chart") || exit $?
+          if [ "$cur" = "$v" ]; then
+            echo "chart appVersion already $v" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          chart_version=$(sed -n 's/^version: //p' "$chart") || exit $?
+          IFS=. read -r a b c <<<"$chart_version"
+          new="$a.$b.$((c + 1))"
+          sed -i "s/^version: .*/version: $new/; s/^appVersion: .*/appVersion: \"$v\"/" "$chart"
+          branch="chore/chart-appversion-$v"
+          title="chore(helm): chart $new — appVersion $v"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git commit -qam "$title"
+          git push -f origin "$branch"
+          open_prs=$(gh pr list --repo "$REPO" --head "$branch" --json number --jq 'length') || exit $?
+          if [ "$open_prs" = 0 ]; then
+            body="Opened by release.yml after publishing $TAG: \`image.tag\` empty now deploys the release that exists. Chart-only, so merging it cuts no version."
+            if ! gh pr create --repo "$REPO" --base main --head "$branch" --title "$title" --body "$body"; then
+              echo "::warning::could not open the PR (repo setting 'Allow GitHub Actions to create and approve pull requests' is off?)"
+              echo "chart appVersion → $v pushed to \`$branch\`, open it by hand: https://github.com/$REPO/compare/main...$branch?expand=1" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          fi
+          # A PR opened with GITHUB_TOKEN gets its pull_request runs parked in action_required
+          # (approval); left alone they turn into a red 0-job "failure" the moment the PR merges
+          # or closes, next to the green dispatch run below. Approve them so ci.yml runs as the
+          # PR's own check.
+          # Only this PR's runs are touched: same repo, same branch, same commit, and (when the
+          # run lists its pull_requests at all, which these bot runs did not) this PR's number.
+          # Another PR or a fork at the same SHA is not ours to approve.
+          # ci.yml is dispatched only if no run of it was ever seen past the approval gate while
+          # polling. Approved, running and finished runs all count, so an approve whose response
+          # got lost (the runs are re-read every round) or a run somebody approved by hand cannot
+          # double CI. A failed read keeps what the previous read showed rather than blanking it,
+          # and once a run has been seen past the gate that is remembered; this PR's other runs
+          # awaiting approval (release-gate, ...) are still approved in that round. Polling is 12 rounds of
+          # an API read + 5s sleep, i.e. at least 60s, not a hard cap.
+          sha=$(git rev-parse HEAD) || exit $?
+          pr=$(gh pr list --repo "$REPO" --head "$branch" --json number --jq '.[0].number') || exit $?
+          # Non-zero when the list or the filter fails, so "no runs yet" ([]) and "could not read" differ.
+          my_runs() {
+            gh api "repos/$REPO/actions/runs?head_sha=$sha&event=pull_request&per_page=100" 2>/dev/null \
+              | jq -c --arg repo "$REPO" --arg branch "$branch" --arg sha "$sha" --argjson pr "$pr" \
+                '[.workflow_runs[]
+                  | select(.head_repository.full_name == $repo and .head_branch == $branch and .head_sha == $sha)
+                  | select((.pull_requests | length) == 0 or any(.pull_requests[]; .number == $pr))
+                  | {id, path, status, conclusion}]' 2>/dev/null
+          }
+          # A run waiting for approval is status=completed, conclusion=action_required on the REST
+          # API (status=action_required is only what the list filter accepts), so test both.
+          awaiting='(.status == "action_required" or .conclusion == "action_required")'
+          ci_past_gate() { jq -e ".[] | select(.path == \".github/workflows/ci.yml\" and ($awaiting | not))" <<<"$1" >/dev/null 2>&1; }
+          runs='[]'
+          past_gate=""
+          for ((_poll = 1; _poll <= 12; _poll++)); do
+            capture now now_rc my_runs || exit 1
+            if [ "$now_rc" = 0 ]; then runs=$now; fi
+            if ci_past_gate "$runs"; then past_gate=1; fi
+            capture rows rc jq -r ".[] | select($awaiting) | \"\\(.id) \\(.path)\"" <<<"$runs" 2>/dev/null || exit 1
+            if [ "$rc" != 0 ]; then rows=""; echo "jq over the runs exited $rc: nothing to approve this round" >&2; fi   # whatever it printed before dying is not a list to act on
+            while read -r id path; do
+              [ -n "$id" ] || continue
+              if gh api -X POST "repos/$REPO/actions/runs/$id/approve" >/dev/null 2>&1; then
+                [ "$path" != .github/workflows/ci.yml ] || past_gate=1   # accepted: CI starts, whatever the next read says
+              else
+                echo "approve of run $id failed" >> "$RUNNER_TEMP/approve-errors.txt"
+              fi
+            done <<<"$rows"
+            [ -z "$past_gate" ] || break
+            sleep 5
+          done
+          if [ -z "$past_gate" ]; then
+            capture now now_rc my_runs || exit 1
+            if [ "$now_rc" = 0 ]; then runs=$now; fi
+            ci_past_gate "$runs" && past_gate=1
+          fi
+          if [ -z "$past_gate" ]; then
+            echo "::warning::no ci.yml pull_request run of $branch got past approval, dispatching it instead"
+            approve_failures=0   # the loop above writes one line per failed approve; no file = it never failed. Counted in bash: no wc whose failure could print as 0
+            if [ -f "$RUNNER_TEMP/approve-errors.txt" ]; then
+              while IFS= read -r _; do approve_failures=$((approve_failures + 1)); done < "$RUNNER_TEMP/approve-errors.txt"
+            fi
+            echo "ci.yml: dispatched, not approved ($approve_failures approve failure(s), last runs seen: $runs)" >> "$GITHUB_STEP_SUMMARY"
+            gh workflow run ci.yml --repo "$REPO" --ref "$branch"
+          fi
+          pr_now=$(gh pr list --repo "$REPO" --head "$branch" --json number --jq '.[0].number') || exit $?
+          gh workflow run release-gate.yml --repo "$REPO" --ref main -f pr="$pr_now"
+          pr_url=$(gh pr list --repo "$REPO" --head "$branch" --json url --jq '.[0].url') || exit $?
+          echo "chart appVersion → $v: $pr_url" >> "$GITHUB_STEP_SUMMARY"

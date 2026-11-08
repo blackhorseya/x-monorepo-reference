@@ -1,0 +1,218 @@
+# goreleaser — every green CI run on main → GitHub Release (archives per OS/arch) + one image per
+# app on ghcr. .github/workflows/release.yml drives it: release-drafter makes the draft, goreleaser
+# fills it (this file), `gh release edit --draft=false` publishes it and creates the tag.
+#   task release-snapshot      # local dry run: binaries + archives under bin/dist, no images, no publish
+#   task release-check         # validate this file
+# ci.yml runs the snapshot on PRs.
+# Six apps (rpc, catalog-rpc, payment-rpc, payment-worker, worker, migrate), one module each under go.work; goreleaser builds from each app dir, go.work is found
+# by walking up (no root go.mod, hence project_name is explicit). The seventh image, the web
+# console (web/apps/console/Dockerfile), has no Go binary: release.yml pushes it with docker buildx
+# right after this, same tags.
+version: 2
+
+project_name: x-monorepo
+dist: bin/dist
+
+before:
+  hooks:
+    - go work sync
+
+builds:
+  - id: rpc
+    binary: rpc
+    dir: apps/rpc
+    main: .
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w
+      - -X github.com/blackhorseya/x-monorepo/pkgs/platform/buildinfo.Version={{ .Version }}
+      - -X github.com/blackhorseya/x-monorepo/pkgs/platform/buildinfo.Commit={{ .FullCommit }}
+      - -X github.com/blackhorseya/x-monorepo/pkgs/platform/buildinfo.Date={{ .CommitDate }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+  - id: catalog-rpc
+    binary: catalog-rpc
+    dir: apps/catalog-rpc
+    main: .
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w
+      - -X github.com/blackhorseya/x-monorepo/pkgs/platform/buildinfo.Version={{ .Version }}
+      - -X github.com/blackhorseya/x-monorepo/pkgs/platform/buildinfo.Commit={{ .FullCommit }}
+      - -X github.com/blackhorseya/x-monorepo/pkgs/platform/buildinfo.Date={{ .CommitDate }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+  - id: payment-rpc
+    binary: payment-rpc
+    dir: apps/payment-rpc
+    main: .
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w
+      - -X github.com/blackhorseya/x-monorepo/pkgs/platform/buildinfo.Version={{ .Version }}
+      - -X github.com/blackhorseya/x-monorepo/pkgs/platform/buildinfo.Commit={{ .FullCommit }}
+      - -X github.com/blackhorseya/x-monorepo/pkgs/platform/buildinfo.Date={{ .CommitDate }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+  - id: payment-worker
+    binary: payment-worker
+    dir: apps/payment-worker
+    main: .
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w
+      - -X github.com/blackhorseya/x-monorepo/pkgs/platform/buildinfo.Version={{ .Version }}
+      - -X github.com/blackhorseya/x-monorepo/pkgs/platform/buildinfo.Commit={{ .FullCommit }}
+      - -X github.com/blackhorseya/x-monorepo/pkgs/platform/buildinfo.Date={{ .CommitDate }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+  - id: worker
+    binary: worker
+    dir: apps/worker
+    main: .
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w
+      - -X github.com/blackhorseya/x-monorepo/pkgs/platform/buildinfo.Version={{ .Version }}
+      - -X github.com/blackhorseya/x-monorepo/pkgs/platform/buildinfo.Commit={{ .FullCommit }}
+      - -X github.com/blackhorseya/x-monorepo/pkgs/platform/buildinfo.Date={{ .CommitDate }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+  - id: migrate
+    binary: migrate
+    dir: apps/migrate
+    main: .
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w
+      - -X github.com/blackhorseya/x-monorepo/pkgs/platform/buildinfo.Version={{ .Version }}
+      - -X github.com/blackhorseya/x-monorepo/pkgs/platform/buildinfo.Commit={{ .FullCommit }}
+      - -X github.com/blackhorseya/x-monorepo/pkgs/platform/buildinfo.Date={{ .CommitDate }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+# One archive per OS/arch holding all six binaries: they ship together (migrate runs before rpc/catalog-rpc/payment-rpc/payment-worker/worker).
+archives:
+  - id: apps
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+      - src: configs/config.example.yaml
+        dst: configs/config.example.yaml
+
+checksum:
+  name_template: checksums.txt
+
+# Keyless (Sigstore) signatures, both from the ambient GitHub OIDC token (release.yml's build job
+# has id-token: write and installs cosign v3): checksums.txt gets a Sigstore bundle
+# (checksums.txt.sigstore.json — signature + certificate + Rekor entry in one file) next to it on
+# the release, every image is signed by digest (docker_signs is publish-phase, after the push).
+# cosign v3's sign-blob writes bundles only (--output-signature / --output-certificate are ignored),
+# so verify with --bundle. See README → Release → 驗證. Snapshots skip this (`--skip=sign`).
+# cosign is pinned to >= v3.1.4 (release.yml / ci.yml `cosign-release`): v3.0.6 fails the whole
+# sign when Rekor answers 409 "equivalent entry already exists" (#195), v3.1.4 fetches that entry.
+# That is Rekor v1 only (#215): scripts/cosign-sign-blob.sh runs the same `cosign sign-blob` and, on
+# a Rekor 409 only, signs again (fresh keyless key) at most twice more; anything else, or the
+# retries running out, or an empty bundle, fails the release.
+signs:
+  - cmd: scripts/cosign-sign-blob.sh
+    artifacts: checksum
+    signature: "${artifact}.sigstore.json"
+    args:
+      - sign-blob
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - "--yes"
+
+# One image per app, multi-arch (linux/amd64 + linux/arm64) from the binaries above — the
+# Dockerfile only COPYs, so no QEMU is needed. dockers_v2 attaches an SBOM (sbom: true is the
+# default) and buildx adds SLSA provenance; release.yml gives the console image the same two. ghcr packages (these and console) are created
+# private on first push: link them to the repo / make them public in GitHub → Packages once.
+dockers_v2:
+  - id: rpc
+    ids: [rpc]
+    images: [ghcr.io/blackhorseya/x-monorepo/rpc]
+    dockerfile: deployments/docker/Dockerfile
+    build_args: { APP: rpc }
+    tags: &image_tags
+      - "{{ .Version }}"
+      - "{{ if not .Prerelease }}latest{{ end }}"
+    annotations: &image_annotations
+      org.opencontainers.image.title: "{{ .ProjectName }}"
+      org.opencontainers.image.description: "Clean Architecture + DDD Go monorepo template"
+      org.opencontainers.image.source: "{{ .GitURL }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.created: "{{ .Date }}"
+      org.opencontainers.image.licenses: MIT
+  - id: catalog-rpc
+    ids: [catalog-rpc]
+    images: [ghcr.io/blackhorseya/x-monorepo/catalog-rpc]
+    dockerfile: deployments/docker/Dockerfile
+    build_args: { APP: catalog-rpc }
+    tags: *image_tags
+    annotations: *image_annotations
+  - id: payment-rpc
+    ids: [payment-rpc]
+    images: [ghcr.io/blackhorseya/x-monorepo/payment-rpc]
+    dockerfile: deployments/docker/Dockerfile
+    build_args: { APP: payment-rpc }
+    tags: *image_tags
+    annotations: *image_annotations
+  - id: payment-worker
+    ids: [payment-worker]
+    images: [ghcr.io/blackhorseya/x-monorepo/payment-worker]
+    dockerfile: deployments/docker/Dockerfile
+    build_args: { APP: payment-worker }
+    tags: *image_tags
+    annotations: *image_annotations
+  - id: worker
+    ids: [worker]
+    images: [ghcr.io/blackhorseya/x-monorepo/worker]
+    dockerfile: deployments/docker/Dockerfile
+    build_args: { APP: worker }
+    tags: *image_tags
+    annotations: *image_annotations
+  - id: migrate
+    ids: [migrate]
+    images: [ghcr.io/blackhorseya/x-monorepo/migrate]
+    dockerfile: deployments/docker/Dockerfile
+    build_args: { APP: migrate }
+    tags: *image_tags
+    annotations: *image_annotations
+
+# `artifacts` default (empty) = the dockers_v2 images above. The default args carry --key; keyless
+# is the override. ${digest} is the pushed index digest, so the signature covers every tag.
+docker_signs:
+  - cmd: cosign
+    args: ["sign", "--yes", "${artifact}@${digest}"]
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+# Release notes come from release-drafter (.github/release-drafter.yml): release.yml runs it
+# first, goreleaser then finds that draft by name and only adds artifacts to it.
+changelog:
+  disable: true
+
+release:
+  github:
+    owner: blackhorseya
+    name: x-monorepo
+  name_template: "{{ .Tag }}"   # must equal release-drafter's name-template: the draft is found by name
+  use_existing_draft: true      # the draft release-drafter just made
+  mode: keep-existing           # its notes are the changelog; only artifacts are added
+  draft: true                   # leave it a draft; release.yml publishes after everything is uploaded

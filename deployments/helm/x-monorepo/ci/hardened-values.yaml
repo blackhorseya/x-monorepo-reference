@@ -1,0 +1,25 @@
+# Profile 6: the hardening knobs on — NetworkPolicies with named peers, a ServiceMonitor for
+# a kube-prometheus-stack release called "monitoring", the console behind them.
+secrets:
+  postgresUrl: postgres://app:app@postgres:5432/app?sslmode=disable
+  catalogRpc: { apiKey: "catalog-rpc-key-0123456789ab" }
+config:
+  ordering: { require_payment: false }
+  otel: { endpoint: otel-collector:4317 }
+rpc:
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+    labels: { release: monitoring }
+console:
+  enabled: true
+networkPolicy:
+  enabled: true
+  rpc:
+    ingressFrom:
+      - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: ingress-nginx } }
+      - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: monitoring } }
+  console:
+    ingressFrom:
+      - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: ingress-nginx } }
+paymentRpc: { enabled: false }

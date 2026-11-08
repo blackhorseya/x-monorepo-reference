@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Print the go.work modules affected by a change, one per line (e.g. "pkgs/ordering").
+#
+#   scripts/affected.sh                 # vs BASE_REF (default origin/main, falls back to HEAD)
+#   scripts/affected.sh --files a b c   # from an explicit file list
+#   scripts/affected.sh --all           # every module
+#
+# Rules:
+#   - a file under a module dir affects that module
+#   - a module affects every module that depends on it (reverse deps via go.work)
+#   - a change outside any module (protos/, buf.gen.yaml, go.work, Taskfile.yml, .golangci.yml) affects all
+#   - so does a change to what the test job itself runs on: .github/workflows/ci.yml,
+#     .github/actions/* and scripts/* (the same inputs scripts/ci-changes.sh runs every job for)
+set -euo pipefail
+self_dir=${0%/*}; [ "$self_dir" != "$0" ] || self_dir=.   # dirname without a $(…)
+cd "$self_dir/.." || exit 1
+. "$self_dir/best-effort.sh" || exit 1   # capture: the status of git diff next to what it printed
+
+modules() { go work edit -json ./go.work | python3 -c 'import json,sys; [print(u["DiskPath"].removeprefix("./")) for u in json.load(sys.stdin)["Use"]]'; }
+
+ALL=$(modules) || exit $?
+
+if [[ "${1:-}" == "--all" ]]; then echo "$ALL"; exit 0; fi
+
+if [[ "${1:-}" == "--files" ]]; then
+  shift; FILES=$(printf '%s\n' "$@") || exit $?
+else
+  BASE="${BASE_REF:-origin/main}"
+  git rev-parse --verify -q "$BASE" >/dev/null || BASE=HEAD
+  # No merge base (a shallow clone) makes the three-dot diff fail. That used to read as "nothing changed on the branch" (|| true)
+  # and shrink the test matrix; now it means "cannot tell", and every module is affected (#462).
+  capture committed committed_rc git diff --no-renames --name-only "$BASE"...HEAD 2>/dev/null || exit 1
+  if [ "$committed_rc" != 0 ]; then
+    echo "affected: git diff $BASE...HEAD failed — treating every module as affected" >&2
+    echo "$ALL"; exit 0
+  fi
+  # one assignment each: a failing git stops the script here, it is not a shorter list
+  worktree=$(git diff --no-renames --name-only HEAD) || exit $?
+  untracked=$(git ls-files --others --exclude-standard) || exit $?
+  FILES=$(printf '%s\n%s\n%s\n' "$committed" "$worktree" "$untracked" | sort -u) || exit $?
+fi
+
+[[ -z "$FILES" ]] && exit 0
+
+# bash 3.2 (macOS /bin/bash) has no associative arrays: track hits as a space-delimited set.
+HIT=" "
+is_hit() { [[ "$HIT" == *" $1 "* ]]; }
+mark()   { is_hit "$1" || HIT="$HIT$1 "; }
+
+for f in $FILES; do
+  matched=""
+  for m in $ALL; do
+    [[ "$f" == "$m/"* ]] && { mark "$m"; matched=1; break; }
+  done
+  # global inputs → everything
+  if [[ -z "$matched" ]] && [[ "$f" == protos/* || "$f" == buf.* || "$f" == go.work || "$f" == Taskfile.yml || "$f" == .golangci.yml || "$f" == .github/workflows/ci.yml || "$f" == .github/actions/* || "$f" == scripts/* ]]; then
+    echo "$ALL"; exit 0
+  fi
+done
+
+# expand to reverse dependencies: a module that requires a hit module is also hit
+changed=1
+while [[ $changed == 1 ]]; do
+  changed=0
+  for m in $ALL; do
+    is_hit "$m" && continue
+    for h in $HIT; do
+      hpath=$(go mod edit -json "$h/go.mod" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Module"]["Path"])') || exit $?
+      if grep -qF "$hpath " "$m/go.mod"; then mark "$m"; changed=1; break; fi
+    done
+  done
+done
+
+for m in $ALL; do is_hit "$m" && echo "$m"; done
+true

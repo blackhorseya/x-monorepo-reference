@@ -1,0 +1,238 @@
+// Package postgres owns what every bounded context shares about Postgres: the
+// gorm handle (pgx underneath) and the migration runner. Row models, queries
+// and error translation stay in each BC's infra/postgres.
+package postgres
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgconn/ctxwatch"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/stdlib"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
+
+	"github.com/blackhorseya/x-monorepo/pkgs/platform/config"
+	"github.com/blackhorseya/x-monorepo/pkgs/platform/otel"
+)
+
+// NewDB opens gorm for cfg.URL and pings once so misconfiguration fails at
+// startup, not on the first request. An empty URL returns a nil *gorm.DB: the
+// app has no database and repositories fall back to memory. The cleanup closes
+// the pool; wire threads it to the injector's cleanup.
+//
+// The pool is capped by cfg (MaxOpenConns and friends, set before the first
+// connection): every app opens its pool here, so rpc, worker and the CLIs all
+// obey postgres.max_open_conns. A config.Postgres built by hand rather than
+// config.Load has zeros: unlimited open, database/sql's own idle default (2),
+// connections never recycled.
+//
+// With cfg.ExpectTarget set (postgres.expect_target), the URL is checked
+// before anything dials: every connection attempt, fallback hosts included,
+// must go to that host:port, or NewDB returns an error naming the expected
+// target and nothing else from the URL. The URL is parsed once, and that parse
+// opens the pool. Empty = no check. Only the target is
+// enforced here; the TLS requirement is `worker bootstrap`'s alone, because
+// local development and in-cluster services legitimately run without it.
+//
+// TranslateError makes the driver surface gorm.ErrDuplicatedKey /
+// ErrForeignKeyViolated instead of raw pgconn codes, so BC repositories can
+// translate with errors.Is. gorm's own logger is silent: errors already reach
+// the usecase Logging decorator, and a second log line per query is noise.
+//
+// Every statement becomes a child span of the request (see tracing.go).
+// Query variables are left out of spans: they are customer data, and the SQL
+// shape is what you need to read a trace.
+func NewDB(cfg config.Postgres, tel *otel.Providers) (*gorm.DB, func(), error) {
+	return open(context.Background(), cfg, tel, false)
+}
+
+// cancelDeadlineDelay is how long a connection waits for the server to answer a cancel request before it is
+// closed anyway (pgconn.CancelRequestContextWatcherHandler.DeadlineDelay).
+const cancelDeadlineDelay = 2 * time.Second
+
+// NewDBContext is NewDB for a command that has ONE deadline, c's, and must not outlive it on the server. It differs
+// from NewDB in exactly two ways, and in nothing else (pool limits, expect_target, time zone, tracing, error
+// redaction are shared):
+//
+//   - connecting and the first ping run under c (NewDB's connect is gorm's own Ping, which has no context, and its
+//     ping is capped at 5s whatever the caller's deadline is), so a peer that takes the StartupMessage and never
+//     answers ends with c;
+//   - when c ends while a statement runs, the connection sends the server a cancel request at once (and closes the
+//     socket after cancelDeadlineDelay if the server does not answer), so the statement is over on the SERVER and
+//     the call returns SQLSTATE 57014. NewDB's pool, like pgx's default, only sets a deadline on the socket: a
+//     backend waiting on a lock does not notice and makes its write when the lock is let go.
+//
+// While a connection is still being made there is no backend key to cancel with: c ending then closes the socket,
+// and that is all that can be done (so nothing can be claimed about a server that had already begun the session).
+// The handler is installed on this pool only, after c is the caller's: it is for short-lived commands, not the
+// serving processes, whose behaviour NewDB keeps.
+func NewDBContext(c context.Context, cfg config.Postgres, tel *otel.Providers) (*gorm.DB, func(), error) {
+	return open(c, cfg, tel, true)
+}
+
+// open is NewDB (serverCancel false: c is only the base of the 5s ping) or NewDBContext (serverCancel true).
+func open(c context.Context, cfg config.Postgres, tel *otel.Providers, serverCancel bool) (*gorm.DB, func(), error) {
+	if cfg.URL == "" {
+		return nil, func() {}, nil
+	}
+
+	// One parse, whatever the settings: the config that passes the check (when
+	// expect_target is set) is the one the pool dials with, and the zone
+	// TIMESTAMP columns decode in comes from the same parse, the runtime
+	// parameters pgx sends the session (see openPool). Handing gorm the URL would parse it
+	// a second time, and a service file or the environment can change between
+	// the two reads.
+	cc, err := parseConn(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := mergeTimeZoneKeys(cc); err != nil {
+		return nil, nil, err
+	}
+	if serverCancel {
+		cc.BuildContextWatcherHandler = func(pc *pgconn.PgConn) ctxwatch.Handler {
+			return &pgconn.CancelRequestContextWatcherHandler{Conn: pc, DeadlineDelay: cancelDeadlineDelay}
+		}
+	}
+	pool := openPool(cc)
+
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: pool}), &gorm.Config{
+		TranslateError: true,
+		Logger:         gormlogger.Default.LogMode(gormlogger.Silent),
+		// gorm's own ping is context.Background(): with a caller's context the one ping below is the connect
+		DisableAutomaticPing: serverCancel,
+	})
+	if err != nil {
+		_ = pool.Close()
+
+		return nil, nil, fmt.Errorf("open postgres: %w", redactConnErr(err, cfg.ExpectTarget))
+	}
+	if err := db.Use(tracing{tracer: tel.Tracer.Tracer("github.com/blackhorseya/x-monorepo/pkgs/platform/postgres")}); err != nil {
+		return nil, nil, fmt.Errorf("gorm tracing plugin: %w", err)
+	}
+
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, nil, fmt.Errorf("postgres pool: %w", err)
+	}
+	cleanup := func() { _ = sqlDB.Close() }
+	sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
+	if cfg.MaxIdleConns > 0 { // 0 keeps database/sql's default of 2, not "no idle connections"
+		sqlDB.SetMaxIdleConns(cfg.MaxIdleConns)
+	}
+	sqlDB.SetConnMaxLifetime(cfg.ConnMaxLifetime)
+	sqlDB.SetConnMaxIdleTime(cfg.ConnMaxIdleTime)
+
+	pingCtx := c
+	if !serverCancel {
+		var cancel context.CancelFunc
+		pingCtx, cancel = context.WithTimeout(c, 5*time.Second)
+		defer cancel()
+	}
+	if err := sqlDB.PingContext(pingCtx); err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("ping postgres: %w", redactConnErr(err, cfg.ExpectTarget))
+	}
+
+	return db, cleanup, nil
+}
+
+// parseConn parses cfg.URL once. With cfg.ExpectTarget it also checks the
+// target (and returns the guard's error naming it); without, it only parses.
+// Neither error carries anything parsed from the URL: pgx's own parse error can
+// quote the string.
+func parseConn(cfg config.Postgres) (*pgx.ConnConfig, error) {
+	if cfg.ExpectTarget != "" {
+		cc, err := ParseCheckedConn(cfg.URL, ConnPolicy{ExpectTarget: cfg.ExpectTarget, AllowPlaintext: true})
+		if err != nil {
+			return nil, fmt.Errorf("postgres.expect_target: %w", err)
+		}
+
+		return cc, nil
+	}
+	cc, err := pgx.ParseConfig(cfg.URL)
+	if err != nil {
+		return nil, fmt.Errorf("open postgres: %w", errUnparsableURL)
+	}
+
+	return cc, nil
+}
+
+// errConflictingTimeZones is what a URL that names two different zones is
+// refused with. It says nothing of the zones or the rest of the URL.
+var errConflictingTimeZones = errors.New("postgres.url has conflicting timezone parameters")
+
+// mergeTimeZoneKeys leaves cc with at most one timezone parameter, under the
+// lower-case key, so that "the session's timezone" is one entry that can be read.
+// Postgres treats TimeZone, timezone and TIMEZONE as one setting, but pgx keeps
+// one map entry per spelling and sends them in map order, so with two spellings
+// the server applies whichever it reads last, a different one from connection to
+// connection. Spellings that agree are merged; ones that name different zones
+// are refused, as no answer is right. The same spelling repeated is not a case
+// of this: pgx keeps its last value. "time_zone" is not a spelling of the
+// setting and is left alone (Postgres refuses it).
+func mergeTimeZoneKeys(cc *pgx.ConnConfig) error {
+	var (
+		keys  []string
+		value string
+	)
+	for k, v := range cc.RuntimeParams {
+		if !strings.EqualFold(k, "timezone") {
+			continue
+		}
+		if len(keys) > 0 && v != value {
+			return errConflictingTimeZones
+		}
+		keys = append(keys, k)
+		value = v
+	}
+	if len(keys) == 0 || (len(keys) == 1 && keys[0] == "timezone") {
+		return nil
+	}
+	for _, k := range keys {
+		delete(cc.RuntimeParams, k)
+	}
+	cc.RuntimeParams["timezone"] = value
+
+	return nil
+}
+
+// openPool opens the pool from cc and does what gorm's driver does for a DSN
+// (postgres.go:95-121, v1.6.3), which handing the driver a Conn skips: the zone
+// TIMESTAMP (without time zone) columns decode in is the session's own, the
+// timezone runtime parameter pgx sends (NewDB has merged its spellings into the
+// one lower-case key). Taking it from there rather than from a regexp over the
+// DSN text makes the two the same value whichever way pgx got it (the URL, PGTZ,
+// a service file, a percent-encoded value), and a password can never be one: it
+// is not among the runtime parameters, which TestPasswordFragmentsNeverReachRuntimeParams
+// pins. What is dialed comes from cc alone. PreferSimpleProtocol and the other
+// driver options are not used by NewDB.
+func openPool(cc *pgx.ConnConfig) *sql.DB {
+	var opts []stdlib.OptionOpenDB
+	if zone := cc.RuntimeParams["timezone"]; zone != "" {
+		opts = append(opts, stdlib.OptionAfterConnect(func(_ context.Context, conn *pgx.Conn) error {
+			loc, err := time.LoadLocation(zone)
+			if err != nil {
+				return err
+			}
+			conn.TypeMap().RegisterType(&pgtype.Type{
+				Name:  "timestamp",
+				OID:   pgtype.TimestampOID,
+				Codec: &pgtype.TimestampCodec{ScanLocation: loc},
+			})
+
+			return nil
+		}))
+	}
+
+	return stdlib.OpenDB(*cc, opts...)
+}

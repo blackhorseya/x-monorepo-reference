@@ -1,0 +1,654 @@
+# Grafana-managed alert rules for the worker's event bus, provisioned from the repo
+# (mounted into otel-lgtm at /otel-lgtm/grafana/conf/provisioning/alerting/x-monorepo.yaml).
+# Alerting provisioning is read at startup only: after editing run `task grafana-reload`.
+#
+# The worker-eventbus group evaluates the gauges apps/worker exports (platform/eventbus.Lag): each
+# is per replica, so those rules aggregate with max, never sum. The rpc-auth group reads counters
+# (auth_decisions_total, rpc_server_call_duration_seconds_count), which are summed across replicas. Thresholds are a laptop/demo starting point —
+# a deployment tunes them here, and routes them by attaching a notification policy to the
+# severity label (nothing is provisioned for delivery: the alerts show in Alerting → Alert rules
+# and as state on the "Worker — eventbus" panels of the x-monorepo / service dashboard).
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: worker-eventbus
+    folder: x-monorepo
+    interval: 1m
+    rules:
+      # Backlog is growing faster than the handlers drain it (or nobody is consuming).
+      - uid: x-monorepo-eventbus-lag
+        title: Eventbus consumer lag
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: max by (topic, consumer_group, broker) (eventbus_consumer_lag)
+              legendFormat: "{{topic}} {{consumer_group}} ({{broker}})"
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [100] }
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: warning, service: worker }
+        annotations:
+          summary: "{{ $labels.consumer_group }} is {{ $values.A }} messages behind on {{ $labels.topic }}"
+          description: >-
+            eventbus_consumer_lag has been above 100 for 5 minutes. Either the handlers are slower than the producers
+            (scale the worker: replicas sharing worker.consumer_group split the work) or no worker is consuming
+            this group. Oldest-age tells which: a growing age with a flat lag means nothing is being acked.
+          __dashboardUid__: x-monorepo-rpc
+          __panelId__: "25"
+
+      # The head of the queue is old: consumption stalled, whatever the count says.
+      - uid: x-monorepo-eventbus-stale
+        title: Eventbus consumer stalled
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: max by (topic, consumer_group, broker) (eventbus_consumer_oldest_age_seconds)
+              legendFormat: "{{topic}} {{consumer_group}} ({{broker}})"
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [600] }
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: critical, service: worker }
+        annotations:
+          summary: "oldest unacked message on {{ $labels.topic }} for {{ $labels.consumer_group }} is {{ $values.A }}s old"
+          description: >-
+            eventbus_consumer_oldest_age_seconds has been above 10 minutes for 5 minutes: the group is not making
+            progress on this topic. Check the worker is running and healthy, then its logs for the handler
+            (one "message" line per attempt) — a message that keeps failing is retried then parked on the poison
+            table, so a *stuck* head usually means the subscriber itself is blocked (DB / Redis connectivity).
+          __dashboardUid__: x-monorepo-rpc
+          __panelId__: "26"
+
+      # Something is parked: a human has to look (worker poison list / show / requeue / drop).
+      - uid: x-monorepo-eventbus-poison
+        title: Eventbus poison messages
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: max by (topic) (eventbus_poison_messages)
+              legendFormat: "{{topic}}"
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        for: 1m
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: warning, service: worker }
+        annotations:
+          summary: "{{ $values.A }} message(s) parked on {{ $labels.topic }}"
+          description: >-
+            A handler gave up on these after every retry; nothing consumes the poison table, so the alert stays
+            until an operator acts: `task poison -- list` (or `worker poison list` in the image) shows them with
+            the last error, `show <bc> <offset>` the payload, then `requeue` (after the fix) or `drop`.
+          __dashboardUid__: x-monorepo-rpc
+          __panelId__: "27"
+
+      # Retention is overdue: the oldest row still in an outbox / inbox table is older than prune should
+      # allow — prune is not running, or something holds the rows back (see the next rule).
+      - uid: x-monorepo-eventbus-retention
+        title: Eventbus retention overdue
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: max by (table) (eventbus_outbox_oldest_age_seconds or label_replace(eventbus_inbox_oldest_age_seconds, "table", "$1.inbox", "schema", "(.*)"))
+              legendFormat: "{{table}}"
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [3888000] }
+        for: 1h
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: warning, service: worker }
+        annotations:
+          summary: "oldest row in {{ $labels.table }} is {{ $values.A }}s old"
+          description: >-
+            The oldest row still in the table is older than 45 days (1.5× the `task prune -- --older-than 720h`
+            example — set this to 1.5× whatever your prune job uses). Either prune is not scheduled, or it runs and
+            cannot delete: `task prune -- --older-than 720h --dry-run` says which, its NOTE column lists the consumer
+            groups with unread rows ("held back by" = past the retention); so does the console's dry run at `/prune?bc=<schema>` (the part of the table
+            name before the dot). A poison row's inbox id is kept on purpose (it can be requeued any time).
+          __dashboardUid__: x-monorepo-rpc
+          __panelId__: "29"
+
+      # The saga's happy path never closed: an order has waited for inventory's answer (StockReserved →
+      # CONFIRMED, or a shortfall → CANCELLED) for 10 minutes. Nothing on the eventbus rules has to be red for
+      # this: a handler that keeps dropping (domain error) acks fine and shows up here and nowhere else.
+      - uid: x-monorepo-saga-pending
+        title: Saga stuck — order PENDING too long
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: max (ordering_orders_oldest_age_seconds{status="PENDING"})
+              legendFormat: "oldest PENDING order"
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [600] }
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: warning, service: worker }
+        annotations:
+          summary: "an order has been PENDING for {{ $values.A }}s"
+          description: >-
+            ordering_orders_oldest_age_seconds{status="PENDING"} is above 600: inventory's answer for at least one
+            order never reached ordering. Check eventbus_consumer_lag on ordering.v1.OrderCreated (inventory's
+            group) and inventory.v1.StockReserved (ordering's group), then the poison tables (`task poison -- list`):
+            a StockReserved or OrderCancellationRequested parked there is exactly this. The order itself is
+            `ListOrders status=PENDING` / the console's PENDING filter, oldest first at the bottom.
+          __dashboardUid__: x-monorepo-rpc
+          __panelId__: "36"
+
+      # The reservation TTL is not being enforced: a RESERVED reservation has been held for 1.5 × the
+      # default TTL (24h; deployments/helm/x-monorepo/values.yaml `expire.olderThan` — move both together).
+      # `worker expire` (the expire CronJob) should have released it hours ago: the CronJob is off, failing,
+      # or the sweep keeps losing a race (ABORTED) on the same stock row. Only RESERVED counts: a reservation
+      # the customer completed or cancelled is terminal and never due.
+      - uid: x-monorepo-reservation-expiry
+        title: Reservation expiry overdue — RESERVED held past 1.5 × TTL
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: max (inventory_reservations_oldest_age_seconds{status="RESERVED"})
+              legendFormat: "oldest RESERVED reservation"
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [129600] }
+        for: 15m
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: warning, service: worker }
+        annotations:
+          summary: "a reservation has been RESERVED for {{ $values.A }}s"
+          description: >-
+            inventory_reservations_oldest_age_seconds{status="RESERVED"} is above 129600 (36h = 1.5 × the 24h TTL):
+            `worker expire` has not released it. Check the expire CronJob's last Jobs (`kubectl get jobs -l
+            app.kubernetes.io/component=expire`), then run a dry run — `task expire -- --older-than 24h --dry-run`
+            or the console's Expire page — to see what is due and whether the sweep fails (ABORTED = a lost race
+            on a stock row, rerun). The reservation itself is `ListReservations status=RESERVED`, oldest at the bottom.
+          __dashboardUid__: x-monorepo-rpc
+          __panelId__: "36"
+
+      # A completed order the stock no longer covers: its reservation was EXPIRED by the sweep just before
+      # OrderCompleted arrived, and the released quantity was taken by another order meanwhile (README "與
+      # CompleteOrder 的競態"). The order is COMPLETED, nothing was deducted, the row is COMMIT_SHORT forever.
+      # The row is the audit record and is never removed, so the rule fires on a rise over the last hour
+      # (delta), not on the standing count — it resolves by itself an hour after the last one; the standing
+      # count stays on the "Reservations by status" panel. Runbook: docs/operations.md "COMMIT_SHORT 處置".
+      - uid: x-monorepo-commit-short
+        title: Commit short — a completed order is not covered by stock
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: max (delta(inventory_reservations{status="COMMIT_SHORT"}[1h]))
+              legendFormat: "new COMMIT_SHORT in the last hour"
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: critical, service: worker }
+        annotations:
+          summary: "{{ $values.A }} completed order(s) went COMMIT_SHORT in the last hour"
+          description: >-
+            A reservation ended COMMIT_SHORT: the order is COMPLETED but its stock was released by the expiry
+            sweep and is no longer available, so nothing was deducted. List them with `ListReservations
+            status=COMMIT_SHORT` (console Reservations page, filter COMMIT_SHORT) and settle each by hand —
+            restock or compensate the customer; see docs/operations.md "COMMIT_SHORT 處置".
+          __dashboardUid__: x-monorepo-rpc
+          __panelId__: "35"
+
+      # Rows are held back by a consumer group that is not making progress — while the lag rules above only
+      # watch the groups this worker is configured with, this one sees every cursor in the offsets table,
+      # so a group from a renamed worker.consumer_group or an E2E run shows up here and nowhere else.
+      - uid: x-monorepo-eventbus-held
+        title: Eventbus rows held by a stale consumer group
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: max by (table) (eventbus_outbox_oldest_held_age_seconds)
+              legendFormat: "{{table}}"
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [86400] }
+        for: 30m
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: warning, service: worker }
+        annotations:
+          summary: "a consumer group has not acked a {{ $values.A }}s old row on {{ $labels.table }}"
+          description: >-
+            Some consumer group's cursor on this table is more than a day behind, so prune keeps everything after
+            it. If "Eventbus consumer stalled" is not firing, the group is one no worker runs any more (an old
+            worker.consumer_group, a `test-<ts>.*` group from an E2E run): `task prune -- --older-than 720h --dry-run`
+            lists in NOTE every group with unread rows and the age of its oldest one — the stale group is the one
+            days behind, under "held back by" once past the retention, "behind" before that — then
+            `--forget-group <name>` deletes its cursor so the rows become prunable
+            (console: `/prune?bc=<schema>&forget=<name>`, dry run first).
+            If it is a live group, fix consumption first — forgetting a live group makes it restart from
+            worker.start_from.
+          __dashboardUid__: x-monorepo-rpc
+          __panelId__: "29"
+
+      # No lag series at all: no worker is exporting, so the rules above cannot fire either.
+      - uid: x-monorepo-eventbus-absent
+        title: Eventbus metrics absent
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: absent(eventbus_consumer_lag)
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        for: 10m
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: warning, service: worker }
+        annotations:
+          summary: "no worker has exported eventbus_consumer_lag for 10 minutes"
+          description: >-
+            The lag and poison rules are silent without this series. Either no worker is running, or its OTLP
+            export is not reaching the collector (otel.endpoint).
+
+  # payment-rpc (#367 slice 5c): the payment_* instruments of apps/payment-rpc (counters are summed across
+  # replicas; the reconcile gauges are written by the `expire` CronJob each run, so they are read with
+  # last_over_time over a window longer than the CronJob period, never as an instant that goes stale 5 minutes
+  # after the run). The consumer lag of payment's own group (payment-rpc.payment) is covered by the
+  # worker-eventbus rules above, which take max over every group.
+  - orgId: 1
+    name: payment
+    folder: x-monorepo
+    interval: 1m
+    rules:
+      # A payment ended in a state a person has to look at. The `alert` label is the closed set in docs/operations.md.
+      - uid: x-monorepo-payment-alerts
+        title: Payment needs attention
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 900, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: sum by (alert) (increase(payment_alerts_total[15m]))
+              legendFormat: "{{alert}}"
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: warning, service: payment-rpc }
+        annotations:
+          summary: "payment alert {{ $labels.alert }}: {{ $values.A }} in the last 15 minutes"
+          description: >-
+            payment_alerts_total{alert} moved. The category says what to do (docs/operations.md, Payment, "告警"):
+            amount_mismatch / capture_after_review / orphan_webhook mean money at the provider the system will not
+            settle by itself; provider_query_stuck / reconcile_backlog / reconcile_incomplete mean the sweep cannot
+            see the provider (check its credentials and the CronJob).
+          __dashboardUid__: x-monorepo-rpc
+          __panelId__: "47"
+
+      # The sweep is falling behind: the payment it looked at longest ago has waited more than half the reconcile window.
+      - uid: x-monorepo-payment-reconcile-stale
+        title: Payment reconcile falling behind
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 1800, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: max(last_over_time(payment_reconcile_oldest_unchecked_seconds[30m]))
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [43200] }
+        for: 15m
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: warning, service: payment-rpc }
+        annotations:
+          summary: "the oldest unchecked payment has waited {{ $values.A }}s for a reconcile query"
+          description: >-
+            43200s is half of the default payment.reconcile_window (24h): move it with paymentRpc.config.reconcile_window.
+            Past it, expire_batch x the runs inside the window no longer covers the payments inside it, and one with money
+            at the provider and no webhook may go unseen. Raise paymentRpc.config.expire_batch or shorten
+            paymentRpc.expire.intervalMinutes; also look at provider_query_stuck.
+          __dashboardUid__: x-monorepo-rpc
+          __panelId__: "46"
+
+      # payment-worker is up (its lag gauge exists) but the expire CronJob has reported nothing for an hour: no
+      # measurement, which is not the same as no backlog.
+      - uid: x-monorepo-payment-reconcile-absent
+        title: Payment reconcile gauges absent
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 3600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: absent_over_time(payment_reconcile_eligible[1h]) and on() (count(eventbus_consumer_lag{consumer_group=~"payment-rpc\\..*"}) > 0)
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        for: 30m
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: warning, service: payment-rpc }
+        annotations:
+          summary: "payment-worker is reporting but the expire CronJob has exported no reconcile gauge for an hour"
+          description: >-
+            The CronJob is not running (suspended, failing: kubectl get cronjob/jobs), or its OTLP export does not reach
+            the collector (config.otel.endpoint). Without it nothing sweeps: PENDING payments do not expire and money
+            the webhook never reported is not found. The window is 1h, enough for a CronJob period up to 30 minutes.
+          __dashboardUid__: x-monorepo-rpc
+          __panelId__: "45"
+
+      # ordering applied a PaymentCaptured to a CONFIRMED order whose snapshot says no payment: StartPayment refuses such
+      # orders, so this is an upstream defect (the switch flipped between CONFIRMED and payment? consume made a payment
+      # for an order that should not pay?). Zero on a healthy system.
+      - uid: x-monorepo-payment-event-unexpected
+        title: Payment event unexpected
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 3600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: sum(increase(ordering_payment_event_total{effect="unexpected"}[1h]))
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: warning, service: worker }
+        annotations:
+          summary: "{{ $values.A }} PaymentCaptured event(s) hit an order whose snapshot says no payment in the last hour"
+          description: >-
+            ordering_payment_event_total{effect="unexpected"} should stay 0 (docs/operations.md, "ordering 側"). Look at
+            ordering.require_payment (was it flipped while orders were CONFIRMED?) and at payment-worker (did it open
+            a payment for an order that should not pay?).
+          __dashboardUid__: x-monorepo-rpc
+          __panelId__: "50"
+
+  - orgId: 1
+    name: rpc-auth
+    folder: x-monorepo
+    interval: 1m
+    rules:
+      # Credentials are being rejected at a rate no honest client produces: someone is guessing api keys /
+      # replaying tokens, or a key was rotated and a client still sends the old one.
+      - uid: x-monorepo-auth-invalid
+        title: Auth credential rejections
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: sum by (method) (rate(auth_decisions_total{result="invalid"}[5m]))
+              legendFormat: "{{method}}"
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [1] }
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: warning, service: rpc }
+        annotations:
+          summary: "{{ $values.A }} rejected {{ $labels.method }} credentials per second"
+          description: >-
+            auth_decisions_total{result="invalid"} has grown by more than one per second for 5 minutes. The rpc access
+            lines (`code=unauthenticated auth=anonymous`, Loki `{service_name="rpc"} | code="unauthenticated"`) show the
+            procedures and request ids but never the credential. A single source hammering one procedure is a guess;
+            steady rejections from a known client right after a key rotation mean its config still carries the old key.
+            The http.rate_limit interceptor is outside auth, so a flood is throttled before it reaches this counter.
+          __dashboardUid__: x-monorepo-rpc
+          __panelId__: "32"
+
+      # An OIDC issuer's signing keys have not been refreshed for 2 hours (auth_jwks_age_seconds counts from startup
+      # while there has been no successful fetch). Cached keys keep verifying for up to 24 h, then every token from that
+      # issuer is rejected, so this is the warning that a login outage is coming. Nothing is exported while auth.oidc is off.
+      - uid: x-monorepo-auth-jwks-stale
+        title: OIDC JWKS not refreshed
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: max by (issuer) (auth_jwks_age_seconds)
+              legendFormat: "{{issuer}}"
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [7200] }
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: warning, service: rpc }
+        annotations:
+          summary: "{{ $labels.issuer }} signing keys were last refreshed {{ $values.A }}s ago"
+          description: >-
+            auth_jwks_age_seconds is the time since the last successful JWKS fetch for the issuer. The rpc log has one
+            `oidc: jwks fetch failed` Warn per failed attempt (at most one attempt per issuer every 30 s) with the cause
+            (discovery unreachable, issuer mismatch in the discovery document, HTTP status), and
+            auth_jwks_fetch_total{result="error"} shows the rate. Keys already cached keep verifying for 24 hours after
+            the last success, after which every token from this issuer is rejected.
+
+      # Known principals are being refused by a role gate: either a client was given a key without the role it
+      # needs (admin RPCs want auth.admin_role) or something is probing the admin surface with a valid low-role key.
+      - uid: x-monorepo-auth-denied
+        title: Auth permission denied
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: sum by (rpc_method) (rate(rpc_server_call_duration_seconds_count{rpc_response_status_code="permission_denied"}[5m]))
+              legendFormat: "{{rpc_method}}"
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0.1] }
+        for: 10m
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: warning, service: rpc }
+        annotations:
+          summary: "{{ $labels.rpc_method }} refused {{ $values.A }} authenticated callers per second"
+          description: >-
+            permission_denied responses (x-error-code auth.permission_denied: the principal verified but lacks the role
+            the handler requires) have been above 0.1/s for 10 minutes on this RPC. The access line carries `sub`, so
+            `{service_name="rpc"} | code="permission_denied"` names the caller: a legitimate operator needs the role
+            on their key (auth.api_keys `name=key:role`) or JWT (`roles` claim); anything else is probing.
+          __dashboardUid__: x-monorepo-rpc
+          __panelId__: "32"
+
+  - orgId: 1
+    name: rpc-identity
+    folder: x-monorepo
+    interval: 1m
+    rules:
+      # The key resolver cannot reach the database (or times out): keys not verified in the last 30s are
+      # rejected as auth.invalid_credential, so callers with a valid key are being locked out.
+      - uid: x-monorepo-identity-resolver-errors
+        title: Identity resolver errors
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: >-
+                sum(rate(identity_resolver_lookups_total{result="error"}[5m]))
+                / sum(rate(identity_resolver_lookups_total{result=~"db_ok|db_miss|error"}[5m]))
+              legendFormat: error share of DB lookups
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0.05] }
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels: { severity: critical, service: rpc }
+        annotations:
+          summary: "{{ $values.A }} of identity key lookups are failing"
+          description: >-
+            More than 5% of the lookups that reach the database (identity_resolver_lookups_total result=error
+            over db_ok + db_miss + error) have failed for 5 minutes. A healthy resolver has none: only an
+            infrastructure failure (Postgres down or unreachable, auth.resolver_timeout expiring) produces one. The
+            denominator excludes cache hits on purpose — during an outage cached keys keep passing and would dilute
+            the ratio. Keys verified within the 30s TTL are still served; everything else is rejected as
+            auth.invalid_credential. Check Postgres first, then `{service_name="rpc"} |= "credential resolver failed"` in Loki.
+          __dashboardUid__: x-monorepo-rpc
+          __panelId__: "40"
